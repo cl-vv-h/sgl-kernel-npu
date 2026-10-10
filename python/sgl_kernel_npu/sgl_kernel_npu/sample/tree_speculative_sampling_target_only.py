@@ -103,6 +103,7 @@ def _tree_target_only_block_sum_kernel(
     vocab_size: tl.constexpr,
     vocab_block_size: tl.constexpr,
     num_vocab_blocks: tl.constexpr,
+    COMPACT_RESIDUAL: tl.constexpr = False,
 ):
     program_idx = tl.program_id(0)
     num_programs = tl.num_programs(0)
@@ -115,18 +116,24 @@ def _tree_target_only_block_sum_kernel(
         vocab_mask = vocab_offsets < vocab_size
 
         target_row = tl.load(metadata + req_idx * 2).to(tl.int64)
-        probs_offset = (req_idx * num_draft_tokens + target_row) * vocab_size
+        if COMPACT_RESIDUAL:
+            probs_offset = req_idx.to(tl.int64) * vocab_size
+        else:
+            probs_offset = (req_idx * num_draft_tokens + target_row) * vocab_size
         target = tl.load(
             target_probs + probs_offset + vocab_offsets,
             mask=vocab_mask,
             other=0.0,
         ).to(tl.float32)
-        rejected = tl.load(
-            rejected_probs + probs_offset + vocab_offsets,
-            mask=vocab_mask,
-            other=0.0,
-        ).to(tl.float32)
-        residual = tl.maximum(target - rejected, 0.0)
+        if COMPACT_RESIDUAL:
+            residual = target
+        else:
+            rejected = tl.load(
+                rejected_probs + probs_offset + vocab_offsets,
+                mask=vocab_mask,
+                other=0.0,
+            ).to(tl.float32)
+            residual = tl.maximum(target - rejected, 0.0)
         block_sum = tl.sum(residual, axis=0)
         tl.store(block_sums + req_idx * num_vocab_blocks + block_idx, block_sum)
 
@@ -144,6 +151,7 @@ def _tree_target_only_sample_kernel(
     vocab_block_size: tl.constexpr,
     num_vocab_blocks: tl.constexpr,
     pad_num_vocab_blocks: tl.constexpr,
+    COMPACT_RESIDUAL: tl.constexpr = False,
 ):
     req_idx = tl.program_id(0)
     metadata_offset = req_idx * 2
@@ -170,18 +178,24 @@ def _tree_target_only_sample_kernel(
     local_offsets = tl.arange(0, vocab_block_size)
     vocab_offsets = selected_block * vocab_block_size + local_offsets
     vocab_mask = vocab_offsets < vocab_size
-    probs_offset = (req_idx * num_draft_tokens + target_row) * vocab_size
+    if COMPACT_RESIDUAL:
+        probs_offset = req_idx.to(tl.int64) * vocab_size
+    else:
+        probs_offset = (req_idx * num_draft_tokens + target_row) * vocab_size
     target_probs_block = tl.load(
         target_probs + probs_offset + vocab_offsets,
         mask=vocab_mask,
         other=0.0,
     ).to(tl.float32)
-    rejected_probs_block = tl.load(
-        rejected_probs + probs_offset + vocab_offsets,
-        mask=vocab_mask,
-        other=0.0,
-    ).to(tl.float32)
-    residual = tl.maximum(target_probs_block - rejected_probs_block, 0.0)
+    if COMPACT_RESIDUAL:
+        residual = target_probs_block
+    else:
+        rejected_probs_block = tl.load(
+            rejected_probs + probs_offset + vocab_offsets,
+            mask=vocab_mask,
+            other=0.0,
+        ).to(tl.float32)
+        residual = tl.maximum(target_probs_block - rejected_probs_block, 0.0)
 
     local_cdf = tl.cumsum(residual, axis=0)
     local_index = tl.sum(

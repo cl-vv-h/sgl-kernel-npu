@@ -23,6 +23,10 @@ def _filter_encode_kernel(
     THRESHOLD_STRIDE: tl.constexpr,
     MODE: tl.constexpr,
     BLOCK: tl.constexpr,
+    CANDIDATE_IDS=None,
+    NEXT_TOKEN=None,
+    CANDIDATE_PARTIALS=None,
+    DRAFT: tl.constexpr = 0,
 ):
     for flat in tl.range(tl.program_id(0), R * NB, tl.num_programs(0)):
         row = (flat // NB).to(tl.int64)
@@ -43,6 +47,17 @@ def _filter_encode_kernel(
             threshold = tl.load(thresholds + row * THRESHOLD_STRIDE)
             value = tl.where(offsets >= threshold, 0.0, value)
             tl.store(values + address, value, valid)
+        if DRAFT > 0:
+            child = tl.load(NEXT_TOKEN + row).to(tl.int64)
+            candidate = tl.load(
+                CANDIDATE_IDS + (row // DRAFT) * DRAFT + child,
+                child >= 0,
+                other=-1,
+            ).to(tl.float32)
+            # A full sort contains each token once. Max selects that one FP32
+            # value without changing it; no second full-vocabulary read pass.
+            partial = tl.max(tl.where(valid & (token == candidate), value, 0.0), 0)
+            tl.store(CANDIDATE_PARTIALS + flat, partial)
         # V <= 2**23 makes every encoded integer exactly representable in FP32.
         key = token * 2.0 + (value != 0.0).to(tl.float32)
         tl.store(keys + address, key, valid)
