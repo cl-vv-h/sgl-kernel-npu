@@ -40,44 +40,58 @@ def _selected_accept_kernel(
 ):
     req = tl.program_id(0)
     base = req.to(tl.int64) * D
-    row = tl.full((), 0, tl.int64)
-    output_slot = tl.load(retrieve_index + base).to(tl.int64)
-    coin = tl.load(coins + base).to(tl.float32)
-    accepted_count = 0
-    active = tl.full((), 1, tl.int32)
-    rejected = tl.full((), -1, tl.int64)
-    tl.store(accept_index + req * DEPTH, output_slot)
+    # Keep even single-lane values as vectors. In particular, div_rn and the
+    # partial reduction must not lower to scalar operations inside nested SCF
+    # regions on Ascend. Masked loads/stores preserve the original traversal.
+    lane = tl.arange(0, 1)
+    row = tl.full((1,), 0, tl.int64)
+    output_slot = tl.load(retrieve_index + base + lane).to(tl.int64)
+    coin = tl.load(coins + base + lane).to(tl.float32)
+    accepted_count = tl.full((1,), 0, tl.int32)
+    active = tl.full((1,), True, tl.int1)
+    rejected = tl.full((1,), -1, tl.int64)
+    tl.store(accept_index + req * DEPTH + lane, output_slot)
     blocks = tl.arange(0, PAD_NB)
-    for _depth in range(1, DEPTH):
-        if active == 1:
-            child = tl.load(next_token + base + row).to(tl.int64)
-            if child == -1:
-                active = 0
-            else:
-                parts = tl.load(
-                    partials + (base + row) * NB + blocks, blocks < NB, other=0.0
-                )
-                numerator = tl.max(parts, 0)
-                denom = tl.load(denominator + base + row)
-                probability = tl.div_rn(numerator, denom)
-                token = tl.load(candidates + base + child).to(tl.int64)
-                # Identical threshold expression to the full tree kernel.
-                if (coin <= probability / THRESHOLD_ACC) | (
-                    probability >= THRESHOLD_SINGLE
-                ):
-                    tl.store(predicts + output_slot, token)
-                    accepted_count += 1
-                    output_slot = tl.load(retrieve_index + base + child).to(tl.int64)
-                    tl.store(accept_index + req * DEPTH + accepted_count, output_slot)
-                    row = child
-                    coin = tl.load(coins + base + child).to(tl.float32)
-                else:
-                    rejected = token
-                    active = 0
-    tl.store(accept_token_num + req, accepted_count)
-    tl.store(metadata + req * 2, row)
-    tl.store(metadata + req * 2 + 1, output_slot)
-    tl.store(rejected_token + req, rejected)
+    # Depth is small and known at compile time. No data-dependent if/else or
+    # loop-carried branch results are needed for a single-child tree.
+    for _depth in tl.static_range(1, DEPTH):
+        child = tl.load(next_token + base + row, active, other=-1).to(tl.int64)
+        valid = active & (child >= 0)
+        safe_child = tl.where(valid, child, 0)
+        parts = tl.load(
+            partials + (base + row[:, None]) * NB + blocks[None, :],
+            valid[:, None] & (blocks[None, :] < NB),
+            other=0.0,
+        )
+        denom = tl.load(denominator + base + row, valid, other=1.0)
+        # Exactly one tile can contain the candidate; every other partial is
+        # zero. Dividing before max gives the same RN value while keeping the
+        # division vector-shaped rather than a reduced scalar operation.
+        probability = tl.max(tl.div_rn(parts, denom[:, None]), 1)
+        token = tl.load(candidates + base + safe_child, valid, other=0).to(tl.int64)
+        # Same threshold arithmetic; inactive nodes never write outputs.
+        accepted = valid & (
+            (coin <= probability / THRESHOLD_ACC) | (probability >= THRESHOLD_SINGLE)
+        )
+        tl.store(predicts + output_slot, token, accepted)
+        next_count = accepted_count + accepted.to(tl.int32)
+        next_slot = tl.load(retrieve_index + base + safe_child, accepted, other=0).to(
+            tl.int64
+        )
+        next_coin = tl.load(coins + base + safe_child, accepted, other=0.0).to(
+            tl.float32
+        )
+        tl.store(accept_index + req * DEPTH + next_count, next_slot, accepted)
+        rejected = tl.where(valid & ~accepted, token, rejected)
+        output_slot = tl.where(accepted, next_slot, output_slot)
+        row = tl.where(accepted, child, row)
+        coin = tl.where(accepted, next_coin, coin)
+        accepted_count = next_count
+        active = accepted
+    tl.store(accept_token_num + req + lane, accepted_count)
+    tl.store(metadata + req * 2 + lane, row)
+    tl.store(metadata + req * 2 + 1 + lane, output_slot)
+    tl.store(rejected_token + req + lane, rejected)
 
 
 @triton.jit

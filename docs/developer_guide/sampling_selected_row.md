@@ -48,3 +48,27 @@ SGLang must pass unfiltered probabilities and defer top-p restoration.
 
 The implementation has not been compiled or benchmarked on NPU on the authoring
 host. Run exact-output checks on your CANN/Triton version before full-model A/B.
+
+## Ascend accept-kernel compilation compatibility
+
+The initial implementation was reported to abort in `ttir_to_linalg` while
+compiling `_selected_accept_kernel` (`TypeRange ... null types`). The stack
+identifies the failing kernel but not the specific failing IR operation.
+The compatibility revision keeps acceptance values as one-lane vectors and
+statically unrolls depth, replacing nested runtime branches with masked
+loads/stores and `where` updates. RN division, candidate probabilities and the
+acceptance thresholds are unchanged. No new environment flag or SGLang update
+is needed for this revision.
+
+Check compilation in a single process before restarting the model service:
+
+```bash
+python benchmark/check_selected_accept.py --batch-sizes 1 54 --blocks 1 76 122
+python -m pytest tests/python/sgl_kernel_npu/test_sampling_selected_row.py -q
+python benchmark/bench_sampling_selected_row.py --batch-sizes 1 54
+```
+
+The CPU control-flow test executes the actual new and original kernel bodies
+with a NumPy adapter. It checks semantics and masked accesses, not Ascend
+lowering. The isolated NPU check above is still required to establish that the
+compiler workaround succeeds on the target software stack.
