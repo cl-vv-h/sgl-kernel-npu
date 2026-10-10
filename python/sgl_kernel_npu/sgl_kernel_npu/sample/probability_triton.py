@@ -4,6 +4,8 @@ Keep the native probability sort, cumsum, masked sorted-value sum and FP32 key
 sort. No scatter, approximate nucleus selection or alternative tie rule is used.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -131,6 +133,17 @@ def restore_from_ordered_keys(probs, ordered_keys, denominator, division="native
     return output
 
 
+def sort_keep_keys(keys):
+    """Opt-in values-only sort; enable only after exact-key validation on NPU."""
+    if os.environ.get("SGL_KERNEL_NPU_SAMPLING_VALUES_SORT", "0") == "1":
+        import torch_npu
+
+        # Do not silently swallow unsupported dtype/backend errors. Older
+        # SortV2 implementations must pass the exact-key probe before use.
+        return torch_npu.npu_sort_v2(keys, dim=-1, descending=False)
+    return keys.sort(dim=-1).values
+
+
 def filter_and_renorm(
     probs,
     sorted_values,
@@ -142,5 +155,5 @@ def filter_and_renorm(
     keys = filter_encode(sorted_values, sorted_indices, thresholds, cumulative)
     # Keep shape, layout, reduction order and clamp identical to b47970c.
     denominator = sorted_values.sum(dim=-1, keepdim=True).clamp_min_(1e-20)
-    ordered_keys = keys.sort(dim=-1).values
+    ordered_keys = sort_keep_keys(keys)
     return restore_from_ordered_keys(probs, ordered_keys, denominator, division)

@@ -12,11 +12,15 @@ def npu_device():
     return "npu"
 
 
+@pytest.mark.parametrize("values_sort", ["0", "1"])
 @pytest.mark.parametrize("division", ["native", "rn"])
 @pytest.mark.parametrize("vocab", [4, 97, 2051])
 @pytest.mark.parametrize("mode", ["k", "p"])
 @pytest.mark.parametrize("scalar", [False, True])
-def test_fused_renorm_matches_shared_sort(npu_device, division, vocab, mode, scalar):
+def test_fused_renorm_matches_shared_sort(
+    npu_device, division, vocab, mode, scalar, values_sort, monkeypatch
+):
+    monkeypatch.setenv("SGL_KERNEL_NPU_SAMPLING_VALUES_SORT", values_sort)
     from sgl_kernel_npu.sample.probability_triton import filter_and_renorm
 
     generator = torch.Generator().manual_seed(17)
