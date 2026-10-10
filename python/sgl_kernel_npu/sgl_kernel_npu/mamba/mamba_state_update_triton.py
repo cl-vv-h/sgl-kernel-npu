@@ -12,9 +12,12 @@ Complete the following functions:
 follow gpu kernel: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/mamba/mamba_state_scatter_triton.py
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel_npu.utils.triton_utils import get_device_properties
 
 
 @triton.jit
@@ -83,6 +86,93 @@ def move_cache_dynamic_last_kernel_h_block(
             tl.store(dst_base_addr + linear_offset, src_block, mask=mask)
 
 
+@triton.jit
+def _move_cache_tiled_kernel(
+    dst,
+    src,
+    dst_indices,
+    src_indices,
+    last_steps,
+    SL: tl.constexpr,
+    SS: tl.constexpr,
+    SD: tl.constexpr,
+    SH: tl.constexpr,
+    SV: tl.constexpr,
+    SK: tl.constexpr,
+    DL: tl.constexpr,
+    DS: tl.constexpr,
+    DH: tl.constexpr,
+    DV: tl.constexpr,
+    DK: tl.constexpr,
+    DI: tl.constexpr,
+    SI: tl.constexpr,
+    LI: tl.constexpr,
+    N: tl.constexpr,
+    L: tl.constexpr,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    NT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Disjoint request/layer/state tiles. Persistent scheduling bounds launch
+    # size while allowing layers and head subtiles to run on different cores.
+    for flat in tl.range(tl.program_id(0), N * L * NT, tl.num_programs(0)):
+        req = (flat // NT % N).to(tl.int64)
+        layer = (flat // (NT * N)).to(tl.int64)
+        step = tl.load(last_steps + req * LI).to(tl.int64)
+        if step >= 0:
+            source = tl.load(src_indices + req * SI).to(tl.int64)
+            destination = tl.load(dst_indices + req * DI).to(tl.int64)
+            offset = (flat % NT) * BLOCK + tl.arange(0, BLOCK)
+            mask = offset < H * V * K
+            h = (offset // (V * K)).to(tl.int64)
+            v = (offset // K % V).to(tl.int64)
+            k = (offset % K).to(tl.int64)
+            value = tl.load(
+                src + layer * SL + source * SS + step * SD + h * SH + v * SV + k * SK,
+                mask,
+                other=0,
+            )
+            tl.store(
+                dst + layer * DL + destination * DS + h * DH + v * DV + k * DK,
+                value,
+                mask,
+            )
+
+
+def _move_intermediate_cache_tiled(dst, src, dst_indices, src_indices, steps, block):
+    if block not in (1024, 2048, 4096, 8192):
+        raise ValueError(
+            "SGL_KERNEL_NPU_STATE_COPY_BLOCK must be 1024, 2048, 4096 or 8192"
+        )
+    layers, _, _, heads, width, keys = src.shape
+    requests = dst_indices.numel()
+    tiles = triton.cdiv(heads * width * keys, block)
+    if requests and layers and tiles:
+        grid = (min(requests * layers * tiles, get_device_properties()[1]),)
+        _move_cache_tiled_kernel[grid](
+            dst,
+            src,
+            dst_indices,
+            src_indices,
+            steps,
+            *src.stride(),
+            *dst.stride(),
+            dst_indices.stride(0),
+            src_indices.stride(0),
+            steps.stride(0),
+            requests,
+            layers,
+            heads,
+            width,
+            keys,
+            tiles,
+            block,
+        )
+    return dst
+
+
 def move_intermediate_cache(
     ssm_states,
     intermediate_state_cache,
@@ -119,6 +209,28 @@ def move_intermediate_cache(
     assert len(src_indices_tensor) == len(
         last_steps_tensor
     ), "Source indices lengths must match"
+
+    if len(dst_indices_tensor) == 0:
+        return ssm_states
+
+    if os.environ.get("SGL_KERNEL_NPU_STATE_COPY_TILED", "0") == "1":
+        # Both algorithms require unique active destination slots. A shared
+        # source/destination storage could create cross-tile copy dependencies;
+        # retain the existing implementation in that case.
+        if (
+            ssm_states.untyped_storage().data_ptr()
+            != intermediate_state_cache.untyped_storage().data_ptr()
+        ):
+            if ssm_states.shape[0] != L or ssm_states.shape[2:] != (H, V, K):
+                raise ValueError("source and destination state dimensions must match")
+            return _move_intermediate_cache_tiled(
+                ssm_states,
+                intermediate_state_cache,
+                dst_indices_tensor,
+                src_indices_tensor,
+                last_steps_tensor,
+                int(os.environ.get("SGL_KERNEL_NPU_STATE_COPY_BLOCK", "4096")),
+            )
 
     # Grid: one thread per valid index
     grid = (len(dst_indices_tensor),)
