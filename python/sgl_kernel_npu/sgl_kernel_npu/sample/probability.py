@@ -106,10 +106,21 @@ def top_p_renorm_prob(
     if probs.ndim != 2:
         raise ValueError("probs must have shape [batch, vocab]")
 
-    sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
     top_ps = _as_batch_threshold(top_ps, probs, probs.dtype, "top_ps").clamp(
         min=0.0, max=1.0
     )
+    if _use_triton(probs) and os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR", "0") == "1":
+        block_size = int(os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_BLOCK", "512"))
+        if block_size not in (256, 512, 1024):
+            raise ValueError(
+                "SGL_KERNEL_NPU_SAMPLING_AIR_BLOCK must be 256, 512 or 1024"
+            )
+        if probs.shape[-1] <= block_size * 1024:
+            from .probability_air import air_top_p_renorm
+
+            return air_top_p_renorm(probs, top_ps, block_size)
+
+    sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
     cumulative_probs = sorted_probs.cumsum(dim=-1)
     if _use_triton(probs):
         from .probability_triton import filter_and_renorm

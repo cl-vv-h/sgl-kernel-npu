@@ -1,0 +1,8 @@
+AIR Top-P algorithm reference and attribution
+
+Copyright (c) 2026 by FlashInfer team.
+Source: https://github.com/flashinfer-ai/flashinfer/blob/c94c1a9e4bf151e56080168ac880ebf0651af317/include/flashinfer/air_top_p.cuh
+License: Apache-2.0 (see FLASHINFER_LICENSE.txt).
+The reference identifies its core algorithm as derived from TensorRT-LLM AIR Top-P (samplingAirTopPKernels.cu).
+
+This port replaces CUDA/CUB, shared-memory atomics and cooperative synchronization with Ascend Triton partitioned reductions. It uses four-bit radix passes, full input rescans instead of candidate compaction, and RN division with a 1e-20 denominator floor. No FlashInfer CUDA binary is bundled.
