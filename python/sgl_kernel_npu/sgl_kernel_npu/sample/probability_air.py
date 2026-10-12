@@ -26,6 +26,13 @@ _RADIX_BITS = 4
 _BINS = 1 << _RADIX_BITS
 
 
+@triton.jit
+def _air_reverse_key(bits):
+    # uint32 modular subtraction is exactly XOR with 0x7fffffff, including
+    # the inverse transform. Ascend can lower it without OR/AND/NOT expansion.
+    return tl.full((), 0x7FFFFFFF, tl.uint32) - bits
+
+
 # Batch changes only the runtime loop bound, not the tile layout. Avoid compiling
 # another set of radix kernels whenever the active request count changes.
 @triton.jit(do_not_specialize=["ROWS"])
@@ -51,7 +58,7 @@ def _air_histogram_kernel(
         valid = offset < VOCAB
         value = tl.load(probs + row * VOCAB + offset, valid, other=0.0)
         # For nonnegative FP32, reversed bits order values from high to low.
-        key = value.to(tl.uint32, bitcast=True) ^ 0x7FFFFFFF
+        key = _air_reverse_key(value.to(tl.uint32, bitcast=True))
         if not FIRST:
             previous = tl.load(prefix + row).to(tl.uint32)
             valid = valid & ((key >> (SHIFT + 4)) == (previous >> (SHIFT + 4)))
@@ -161,7 +168,7 @@ def _air_compact_kernel(
         row = (flat // TILES).to(tl.int64)
         offset = (flat % TILES) * BLOCK + tl.arange(0, BLOCK)
         value = tl.load(probs + row * VOCAB + offset, offset < VOCAB, other=0.0)
-        key = value.to(tl.uint32, bitcast=True) ^ 0x7FFFFFFF
+        key = _air_reverse_key(value.to(tl.uint32, bitcast=True))
         previous = tl.load(prefix + row).to(tl.uint32)
         match = (offset < VOCAB) & (value > 0.0) & ((key >> 20) == (previous >> 20))
         count = tl.sum(match.to(tl.int32), 0)
@@ -178,7 +185,7 @@ def _air_compact_kernel(
 @triton.jit
 def _air_boundary_histogram(value, valid, previous, SHIFT: tl.constexpr):
     bins = tl.arange(0, 16).to(tl.float16)
-    key = value.to(tl.uint32, bitcast=True) ^ 0x7FFFFFFF
+    key = _air_reverse_key(value.to(tl.uint32, bitcast=True))
     valid = valid & ((key >> (SHIFT + 4)) == (previous >> (SHIFT + 4)))
     bucket = ((key >> SHIFT) & 15).to(tl.float16)
     masked_value = tl.where(valid, value, 0.0)
@@ -246,7 +253,7 @@ def _air_kept_mass_kernel(
         offset = (flat % TILES) * BLOCK + tl.arange(0, BLOCK)
         valid = offset < VOCAB
         key = tl.load(prefix + row).to(tl.uint32)
-        cutoff = (key ^ 0x7FFFFFFF).to(tl.float32, bitcast=True)
+        cutoff = _air_reverse_key(key).to(tl.float32, bitcast=True)
         value = tl.load(probs + row * VOCAB + offset, valid, other=0.0)
         # Explicit p=1 avoids dropping tiny values through prefix-sum rounding.
         keep = (value >= cutoff) | (tl.load(top_ps + row * P_STRIDE) >= 1.0)
@@ -281,7 +288,7 @@ def _air_apply_kernel(
         offset = (flat % TILES) * BLOCK + tl.arange(0, BLOCK)
         valid = offset < VOCAB
         key = tl.load(prefix + row).to(tl.uint32)
-        cutoff = (key ^ 0x7FFFFFFF).to(tl.float32, bitcast=True)
+        cutoff = _air_reverse_key(key).to(tl.float32, bitcast=True)
         value = tl.load(probs + row * VOCAB + offset, valid, other=0.0)
         keep = (value >= cutoff) | (tl.load(top_ps + row * P_STRIDE) >= 1.0)
         value = tl.where(keep, value, 0.0)
