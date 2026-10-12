@@ -81,6 +81,8 @@ def _air_select_kernel(
     P_STRIDE: tl.constexpr,
     SHIFT: tl.constexpr,
     FIRST: tl.constexpr,
+    denominator,
+    REUSE_MASS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     tiles = tl.arange(0, PAD_TILES)
@@ -107,6 +109,21 @@ def _air_select_kernel(
     before = tl.sum(tl.where(bins < chosen, hist, 0.0), 0)
     tl.store(remaining + row, tl.maximum(target - before, 0.0))
     tl.store(prefix + row, old_prefix | (chosen.to(tl.uint32) << SHIFT))
+    if REUSE_MASS:
+        # Each level adds disjoint buckets strictly above the boundary. At
+        # the last level, include the whole boundary bucket (all cutoff ties).
+        # Track this explicitly: target - remaining loses information through
+        # subtraction and clamping. p=1 retains the first pass's full row mass.
+        all_tokens = tl.load(top_ps + row * P_STRIDE) >= 1.0
+        if FIRST:
+            kept = tl.where(all_tokens, tl.sum(hist, 0), before)
+        else:
+            previous_mass = tl.load(denominator + row)
+            kept = tl.where(all_tokens, previous_mass, previous_mass + before)
+        if SHIFT == 0:
+            boundary = tl.sum(tl.where(bins == chosen, hist, 0.0), 0)
+            kept = tl.maximum(tl.where(all_tokens, kept, kept + boundary), 1e-20)
+        tl.store(denominator + row, kept)
 
 
 @triton.jit(do_not_specialize=["ROWS"])
@@ -255,7 +272,7 @@ def _air_apply_kernel(
         tl.store(output + row * VOCAB + offset, value, valid)
 
 
-def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None):
+def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None, reuse_mass=None):
     """Return a full [rows, vocab] tensor in vocabulary order, using RN division.
 
     top_ps is a clamped FP32 vector [rows] (stride zero is supported). No tensor
@@ -263,6 +280,8 @@ def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None):
     output is not guaranteed bitwise identical to the sorted V1 path.
     Compact reductions can also round differently from the full-scan AIR path.
     Set compact=False or SGL_KERNEL_NPU_SAMPLING_AIR_COMPACT=0 for that baseline.
+    Opt in to radix-derived normalization via reuse_mass=True or
+    SGL_KERNEL_NPU_SAMPLING_AIR_REUSE_MASS=1. This changes FP32 summation order.
     """
     if probs.ndim != 2 or probs.dtype != torch.float32 or not probs.is_contiguous():
         raise ValueError("AIR requires a contiguous FP32 [rows, vocab] tensor")
@@ -292,7 +311,10 @@ def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None):
     )
     prefix = torch.empty((rows,), device=probs.device, dtype=torch.int32)
     remaining = torch.empty((rows,), device=probs.device, dtype=torch.float32)
-    partial_sums = torch.empty((rows, tiles), device=probs.device, dtype=torch.float32)
+    if reuse_mass is None:
+        reuse_mass = os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_REUSE_MASS", "0") == "1"
+    if not reuse_mass:
+        partial_sums = torch.empty((rows, tiles), device=probs.device, dtype=torch.float32)
     denominator = torch.empty((rows,), device=probs.device, dtype=torch.float32)
     grid = (min(rows * tiles, get_device_properties()[1]),)
     p_stride = top_ps.stride(0)
@@ -342,28 +364,31 @@ def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None):
             p_stride,
             shift,
             shift == 28,
+            denominator,
+            reuse_mass,
         )
         if compact and shift == 20:
             _air_compact_kernel[grid](
                 probs, prefix, candidates, counts, rows, vocab, tiles, block_size, capacity
             )
-    _air_kept_mass_kernel[grid](
-        probs,
-        prefix,
-        top_ps,
-        partial_sums,
-        rows,
-        vocab,
-        tiles,
-        p_stride,
-        block_size,
-    )
-    _air_denominator_kernel[(rows,)](
-        partial_sums,
-        denominator,
-        tiles,
-        triton.next_power_of_2(tiles),
-    )
+    if not reuse_mass:
+        _air_kept_mass_kernel[grid](
+            probs,
+            prefix,
+            top_ps,
+            partial_sums,
+            rows,
+            vocab,
+            tiles,
+            p_stride,
+            block_size,
+        )
+        _air_denominator_kernel[(rows,)](
+            partial_sums,
+            denominator,
+            tiles,
+            triton.next_power_of_2(tiles),
+        )
     _air_apply_kernel[grid](
         probs,
         prefix,
