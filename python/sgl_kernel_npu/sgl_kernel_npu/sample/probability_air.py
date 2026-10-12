@@ -95,6 +95,42 @@ def _air_histogram_kernel(
 
 
 @triton.jit
+def _air_tile_mass(value, valid, previous, SHIFT: tl.constexpr, FIRST: tl.constexpr):
+    key = _air_reverse_key(value.to(tl.uint32, bitcast=True))
+    if not FIRST:
+        valid = valid & ((key >> (SHIFT + 4)) == (previous >> (SHIFT + 4)))
+    bucket = ((key >> SHIFT) & 15).to(tl.float16)
+    bins = tl.arange(0, 16).to(tl.float16)
+    value = tl.where(valid, value, 0.0)
+    return tl.sum(tl.where(bins[:, None] == bucket[None, :], value[None, :], 0.0), 1)
+
+
+@triton.jit(do_not_specialize=["ROWS"])
+def _air_partial_histogram_kernel(
+    probs, prefix, histogram, ROWS, VOCAB: tl.constexpr, TILES: tl.constexpr,
+    PARTS: tl.constexpr, SHIFT: tl.constexpr, FIRST: tl.constexpr,
+    BLOCK: tl.constexpr, TILE_GROUP: tl.constexpr,
+):
+    bins = tl.arange(0, 16)
+    lanes = tl.arange(0, BLOCK)
+    for flat in tl.range(tl.program_id(0), ROWS * PARTS, tl.num_programs(0)):
+        row = (flat // PARTS).to(tl.int64)
+        first_tile = (flat % PARTS) * TILE_GROUP
+        previous = tl.full((), 0, tl.uint32)
+        if not FIRST:
+            previous = tl.load(prefix + row).to(tl.uint32)
+        mass = tl.full((16,), 0.0, tl.float32)
+        # A group holds only 16 accumulators; input tiles are loaded in turn.
+        # The final group may contain fewer than TILE_GROUP tiles.
+        for tile in tl.range(first_tile, tl.minimum(first_tile + TILE_GROUP, TILES)):
+            offset = tile * BLOCK + lanes
+            valid = offset < VOCAB
+            value = tl.load(probs + row * VOCAB + offset, valid, other=0.0)
+            mass += _air_tile_mass(value, valid, previous, SHIFT, FIRST)
+        tl.store(histogram + flat.to(tl.int64) * 16 + bins, mass)
+
+
+@triton.jit
 def _air_select_kernel(
     histogram,
     prefix,
@@ -297,7 +333,8 @@ def _air_apply_kernel(
 
 
 def air_top_p_renorm(
-    probs, top_ps, block_size=512, *, compact=None, reuse_mass=None, bin_group=None
+    probs, top_ps, block_size=512, *, compact=None, reuse_mass=None, bin_group=None,
+    tile_group=None,
 ):
     """Return a full [rows, vocab] tensor in vocabulary order, using RN division.
 
@@ -311,6 +348,9 @@ def air_top_p_renorm(
     bin_group (or SGL_KERNEL_NPU_SAMPLING_AIR_BIN_GROUP) controls full-scan
     histogram grouping: 16 preserves the baseline; 4 or 8 bounds broadcasts.
     Compact boundary histograms retain their existing implementation.
+    tile_group (SGL_KERNEL_NPU_SAMPLING_AIR_TILE_GROUP, default 1) combines
+    2/4/8/16 input tiles before writing a histogram. Requires compact=False
+    and bin_group=16; FP32 accumulation order differs from the baseline.
     """
     if probs.ndim != 2 or probs.dtype != torch.float32 or not probs.is_contiguous():
         raise ValueError("AIR requires a contiguous FP32 [rows, vocab] tensor")
@@ -331,6 +371,14 @@ def air_top_p_renorm(
         bin_group = int(os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_BIN_GROUP", "16"))
     if bin_group not in (4, 8, 16):
         raise ValueError("AIR bin_group must be 4, 8 or 16")
+    if compact is None:
+        compact = os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_COMPACT", "1") == "1"
+    if tile_group is None:
+        tile_group = int(os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_TILE_GROUP", "1"))
+    if tile_group not in (1, 2, 4, 8, 16):
+        raise ValueError("AIR tile_group must be 1, 2, 4, 8 or 16")
+    if tile_group > 1 and (compact or bin_group != 16):
+        raise ValueError("AIR tile grouping requires compact=False and bin_group=16")
     output = torch.empty_like(probs)
     if not rows:
         return output
@@ -339,8 +387,9 @@ def air_top_p_renorm(
     # Public dispatch falls back to V1 for larger vocabularies/configurations.
     if triton.next_power_of_2(tiles) > 1024:
         raise ValueError("AIR requires ceil(vocab / block_size) <= 1024")
+    parts = triton.cdiv(tiles, tile_group)
     histogram = torch.empty(
-        (rows, tiles, _BINS), device=probs.device, dtype=torch.float32
+        (rows, parts, _BINS), device=probs.device, dtype=torch.float32
     )
     prefix = torch.empty((rows,), device=probs.device, dtype=torch.int32)
     remaining = torch.empty((rows,), device=probs.device, dtype=torch.float32)
@@ -350,9 +399,8 @@ def air_top_p_renorm(
         partial_sums = torch.empty((rows, tiles), device=probs.device, dtype=torch.float32)
     denominator = torch.empty((rows,), device=probs.device, dtype=torch.float32)
     grid = (min(rows * tiles, get_device_properties()[1]),)
+    hist_grid = (min(rows * parts, grid[0]),)
     p_stride = top_ps.stride(0)
-    if compact is None:
-        compact = os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_COMPACT", "1") == "1"
     capacity = 64
     if compact:
         candidates = torch.empty(
@@ -361,7 +409,12 @@ def air_top_p_renorm(
         counts = torch.empty((rows, tiles), device=probs.device, dtype=torch.int32)
 
     for shift in range(28, -1, -4):
-        if compact and shift < 20:
+        if tile_group > 1:
+            _air_partial_histogram_kernel[hist_grid](
+                probs, prefix, histogram, rows, vocab, tiles, parts, shift,
+                shift == 28, block_size, tile_group,
+            )
+        elif compact and shift < 20:
             _air_compact_histogram_kernel[grid](
                 probs,
                 prefix,
@@ -393,8 +446,8 @@ def air_top_p_renorm(
             prefix,
             remaining,
             top_ps,
-            tiles,
-            triton.next_power_of_2(tiles),
+            parts,
+            triton.next_power_of_2(parts),
             p_stride,
             shift,
             shift == 28,
