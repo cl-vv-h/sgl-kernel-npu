@@ -39,6 +39,7 @@ def _air_histogram_kernel(
     SHIFT: tl.constexpr,
     FIRST: tl.constexpr,
     BLOCK: tl.constexpr,
+    BIN_GROUP: tl.constexpr = 16,
 ):
     bins = tl.arange(0, 16)
     # Only bucket labels use FP16: integers 0..15 are exactly representable.
@@ -61,13 +62,29 @@ def _air_histogram_kernel(
         # and combining a separate [16, BLOCK] validity mask on Ascend. Values
         # and reductions remain FP32, with the same reduction axis and order.
         masked_value = tl.where(valid, value, 0.0)
-        mass = tl.sum(
-            tl.where(
-                compare_bins[:, None] == bucket[None, :], masked_value[None, :], 0.0
-            ),
-            1,
-        )
-        tl.store(histogram + flat.to(tl.int64) * 16 + bins, mass)
+        if BIN_GROUP == 16:
+            mass = tl.sum(
+                tl.where(
+                    compare_bins[:, None] == bucket[None, :], masked_value[None, :], 0.0
+                ),
+                1,
+            )
+            tl.store(histogram + flat.to(tl.int64) * 16 + bins, mass)
+        else:
+            # Reuse the loaded tile for all groups. Store each group's result
+            # immediately so only [BIN_GROUP, BLOCK] intermediates are needed.
+            # Do not statically unroll: that can extend buffer lifetimes.
+            for start in tl.range(0, 16, BIN_GROUP, loop_unroll_factor=1):
+                group_bins = start + tl.arange(0, BIN_GROUP)
+                mass = tl.sum(
+                    tl.where(
+                        group_bins.to(tl.float16)[:, None] == bucket[None, :],
+                        masked_value[None, :],
+                        0.0,
+                    ),
+                    1,
+                )
+                tl.store(histogram + flat.to(tl.int64) * 16 + group_bins, mass)
 
 
 @triton.jit
@@ -272,7 +289,9 @@ def _air_apply_kernel(
         tl.store(output + row * VOCAB + offset, value, valid)
 
 
-def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None, reuse_mass=None):
+def air_top_p_renorm(
+    probs, top_ps, block_size=512, *, compact=None, reuse_mass=None, bin_group=None
+):
     """Return a full [rows, vocab] tensor in vocabulary order, using RN division.
 
     top_ps is a clamped FP32 vector [rows] (stride zero is supported). No tensor
@@ -282,6 +301,9 @@ def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None, reuse_mass=
     Set compact=False or SGL_KERNEL_NPU_SAMPLING_AIR_COMPACT=0 for that baseline.
     Opt in to radix-derived normalization via reuse_mass=True or
     SGL_KERNEL_NPU_SAMPLING_AIR_REUSE_MASS=1. This changes FP32 summation order.
+    bin_group (or SGL_KERNEL_NPU_SAMPLING_AIR_BIN_GROUP) controls full-scan
+    histogram grouping: 16 preserves the baseline; 4 or 8 bounds broadcasts.
+    Compact boundary histograms retain their existing implementation.
     """
     if probs.ndim != 2 or probs.dtype != torch.float32 or not probs.is_contiguous():
         raise ValueError("AIR requires a contiguous FP32 [rows, vocab] tensor")
@@ -298,6 +320,10 @@ def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None, reuse_mass=
         raise ValueError("top_ps must be FP32 [rows] on the same NPU")
     if block_size not in (256, 512, 1024):
         raise ValueError("AIR block_size must be 256, 512 or 1024")
+    if bin_group is None:
+        bin_group = int(os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_BIN_GROUP", "16"))
+    if bin_group not in (4, 8, 16):
+        raise ValueError("AIR bin_group must be 4, 8 or 16")
     output = torch.empty_like(probs)
     if not rows:
         return output
@@ -353,6 +379,7 @@ def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None, reuse_mass=
                 shift,
                 shift == 28,
                 block_size,
+                bin_group,
             )
         _air_select_kernel[(rows,)](
             histogram,
