@@ -130,6 +130,55 @@ def _air_partial_histogram_kernel(
         tl.store(histogram + flat.to(tl.int64) * 16 + bins, mass)
 
 
+@triton.jit(do_not_specialize=["ROWS"])
+def _air_row_radix_kernel(
+    probs, top_ps, prefix, denominator, ROWS, VOCAB: tl.constexpr,
+    TILES: tl.constexpr, P_STRIDE: tl.constexpr, BLOCK: tl.constexpr,
+):
+    # A program owns each row it processes through every radix pass. No
+    # cross-program barrier or global histogram is needed. Small row counts
+    # use the partitioned implementation to retain parallelism within a row.
+    bins = tl.arange(0, 16)
+    lanes = tl.arange(0, BLOCK)
+    for row_index in tl.range(tl.program_id(0), ROWS, tl.num_programs(0)):
+        row = row_index.to(tl.int64)
+        p = tl.load(top_ps + row * P_STRIDE)
+        previous = tl.full((), 0, tl.uint32)
+        remaining = tl.full((), 0.0, tl.float32)
+        kept = tl.full((), 0.0, tl.float32)
+        for pass_index in tl.static_range(0, 8):
+            shift = 28 - 4 * pass_index
+            hist = tl.full((16,), 0.0, tl.float32)
+            # Two-level accumulation bounds the length of a serial FP32 sum:
+            # at most eight tiles per partial, then ceil(TILES / 8) partials.
+            for first_tile in tl.range(0, TILES, 8):
+                partial = tl.full((16,), 0.0, tl.float32)
+                for tile in tl.range(first_tile, tl.minimum(first_tile + 8, TILES)):
+                    offset = tile * BLOCK + lanes
+                    valid = offset < VOCAB
+                    value = tl.load(probs + row * VOCAB + offset, valid, other=0.0)
+                    partial += _air_tile_mass(value, valid, previous, shift, pass_index == 0)
+                hist += partial
+            if pass_index == 0:
+                remaining = p * tl.sum(hist, 0)
+            cumulative = tl.cumsum(hist, 0)
+            chosen = tl.min(tl.where((hist > 0.0) & (cumulative >= remaining), bins, 16), 0)
+            last = tl.max(tl.where(hist > 0.0, bins, -1), 0)
+            chosen = tl.where(chosen < 16, chosen, tl.where(last >= 0, last, 15))
+            before = tl.sum(tl.where(bins < chosen, hist, 0.0), 0)
+            remaining = tl.maximum(remaining - before, 0.0)
+            previous = previous | (chosen.to(tl.uint32) << shift)
+            if pass_index == 0:
+                kept = tl.where(p >= 1.0, tl.sum(hist, 0), before)
+            else:
+                kept = tl.where(p >= 1.0, kept, kept + before)
+            if pass_index == 7:
+                boundary = tl.sum(tl.where(bins == chosen, hist, 0.0), 0)
+                kept = tl.maximum(tl.where(p >= 1.0, kept, kept + boundary), 1e-20)
+        tl.store(prefix + row, previous)
+        tl.store(denominator + row, kept)
+
+
 @triton.jit
 def _air_select_kernel(
     histogram,
@@ -334,7 +383,7 @@ def _air_apply_kernel(
 
 def air_top_p_renorm(
     probs, top_ps, block_size=512, *, compact=None, reuse_mass=None, bin_group=None,
-    tile_group=None,
+    tile_group=None, row_fused=None,
 ):
     """Return a full [rows, vocab] tensor in vocabulary order, using RN division.
 
@@ -351,6 +400,10 @@ def air_top_p_renorm(
     tile_group (SGL_KERNEL_NPU_SAMPLING_AIR_TILE_GROUP, default 1) combines
     2/4/8/16 input tiles before writing a histogram. Requires compact=False
     and bin_group=16; FP32 accumulation order differs from the baseline.
+    row_fused (SGL_KERNEL_NPU_SAMPLING_AIR_ROW_FUSED, default 0) keeps all radix
+    passes local to each row. Requires reuse_mass=True, compact=False,
+    bin_group=16 and tile_group=1. Falls back to partitioned radix when rows
+    are fewer than the device's vector cores. FP32 summation order changes.
     """
     if probs.ndim != 2 or probs.dtype != torch.float32 or not probs.is_contiguous():
         raise ValueError("AIR requires a contiguous FP32 [rows, vocab] tensor")
@@ -379,6 +432,15 @@ def air_top_p_renorm(
         raise ValueError("AIR tile_group must be 1, 2, 4, 8 or 16")
     if tile_group > 1 and (compact or bin_group != 16):
         raise ValueError("AIR tile grouping requires compact=False and bin_group=16")
+    if reuse_mass is None:
+        reuse_mass = os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_REUSE_MASS", "0") == "1"
+    if row_fused is None:
+        row_fused = os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_ROW_FUSED", "0") == "1"
+    if row_fused and (not reuse_mass or compact or bin_group != 16 or tile_group != 1):
+        raise ValueError(
+            "AIR row fusion requires reuse_mass=True, compact=False, "
+            "bin_group=16 and tile_group=1"
+        )
     output = torch.empty_like(probs)
     if not rows:
         return output
@@ -387,20 +449,27 @@ def air_top_p_renorm(
     # Public dispatch falls back to V1 for larger vocabularies/configurations.
     if triton.next_power_of_2(tiles) > 1024:
         raise ValueError("AIR requires ceil(vocab / block_size) <= 1024")
+    cores = get_device_properties()[1]
+    prefix = torch.empty((rows,), device=probs.device, dtype=torch.int32)
+    denominator = torch.empty((rows,), device=probs.device, dtype=torch.float32)
+    grid = (min(rows * tiles, cores),)
+    p_stride = top_ps.stride(0)
+    if row_fused and rows >= cores:
+        _air_row_radix_kernel[(min(rows, cores),)](
+            probs, top_ps, prefix, denominator, rows, vocab, tiles, p_stride, block_size,
+        )
+        _air_apply_kernel[grid](
+            probs, prefix, top_ps, denominator, output, rows, vocab, tiles, p_stride, block_size,
+        )
+        return output
     parts = triton.cdiv(tiles, tile_group)
     histogram = torch.empty(
         (rows, parts, _BINS), device=probs.device, dtype=torch.float32
     )
-    prefix = torch.empty((rows,), device=probs.device, dtype=torch.int32)
     remaining = torch.empty((rows,), device=probs.device, dtype=torch.float32)
-    if reuse_mass is None:
-        reuse_mass = os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_REUSE_MASS", "0") == "1"
     if not reuse_mass:
         partial_sums = torch.empty((rows, tiles), device=probs.device, dtype=torch.float32)
-    denominator = torch.empty((rows,), device=probs.device, dtype=torch.float32)
-    grid = (min(rows * tiles, get_device_properties()[1]),)
     hist_grid = (min(rows * parts, grid[0]),)
-    p_stride = top_ps.stride(0)
     capacity = 64
     if compact:
         candidates = torch.empty(
