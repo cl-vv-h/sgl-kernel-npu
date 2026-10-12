@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 # Modifications: NPU Triton implementation using partitioned reductions,
-# four-bit radix passes, full-row rescans and round-to-nearest normalization.
+# four-bit radix passes, bounded candidate compaction and RN normalization.
 # Reference: flashinfer/include/flashinfer/air_top_p.cuh at
 # c94c1a9e4bf151e56080168ac880ebf0651af317. License and attribution below.
 """Experimental AIR-style top-p renormalization for FP32 NPU probabilities.
 
 This is a weighted radix SELECT, not a radix sort. Each pass refines only the
-selected bit prefix. Partial histograms have a unique writer; no scatter or
-atomic updates are required. This initial port rescans input each pass rather
-than compacting the boundary bucket into CUDA-style scratch buffers.
+selected bit prefix. After three passes, compact the boundary candidates into
+bounded per-tile storage. Dense tiles fall back to the original input; candidate
+overflow never truncates the distribution. No global atomics are required.
 
 Inputs must be finite, nonnegative probabilities. All ties at the cutoff are
 kept. The target mass is top_p * row_sum; this is not bitwise V1 semantics.
 """
+
+import os
 
 import torch
 import triton
@@ -101,6 +103,91 @@ def _air_select_kernel(
 
 
 @triton.jit(do_not_specialize=["ROWS"])
+def _air_compact_kernel(
+    probs,
+    prefix,
+    candidates,
+    counts,
+    ROWS,
+    VOCAB: tl.constexpr,
+    TILES: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CAPACITY: tl.constexpr,
+):
+    # The first three radix passes have resolved bits [31:20]. Each tile owns
+    # its output slice. The exclusive ranks of matching lanes are unique.
+    for flat in tl.range(tl.program_id(0), ROWS * TILES, tl.num_programs(0)):
+        row = (flat // TILES).to(tl.int64)
+        offset = (flat % TILES) * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(probs + row * VOCAB + offset, offset < VOCAB, other=0.0)
+        key = value.to(tl.uint32, bitcast=True) ^ 0x7FFFFFFF
+        previous = tl.load(prefix + row).to(tl.uint32)
+        match = (offset < VOCAB) & (value > 0.0) & ((key >> 20) == (previous >> 20))
+        count = tl.sum(match.to(tl.int32), 0)
+        tl.store(counts + flat, count)
+        if (count > 0) & (count <= CAPACITY):
+            rank = tl.cumsum(match.to(tl.int32), 0) - 1
+            tl.store(
+                candidates + flat.to(tl.int64) * CAPACITY + rank,
+                value,
+                match,
+            )
+
+
+@triton.jit
+def _air_boundary_histogram(value, valid, previous, SHIFT: tl.constexpr):
+    bins = tl.arange(0, 16)
+    key = value.to(tl.uint32, bitcast=True) ^ 0x7FFFFFFF
+    valid = valid & ((key >> (SHIFT + 4)) == (previous >> (SHIFT + 4)))
+    bucket = (key >> SHIFT) & 15
+    return tl.sum(
+        tl.where(
+            valid[None, :] & (bins[:, None] == bucket[None, :]), value[None, :], 0.0
+        ),
+        1,
+    )
+
+
+@triton.jit(do_not_specialize=["ROWS"])
+def _air_compact_histogram_kernel(
+    probs,
+    prefix,
+    candidates,
+    counts,
+    histogram,
+    ROWS,
+    VOCAB: tl.constexpr,
+    TILES: tl.constexpr,
+    SHIFT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CAPACITY: tl.constexpr,
+):
+    bins = tl.arange(0, 16)
+    for flat in tl.range(tl.program_id(0), ROWS * TILES, tl.num_programs(0)):
+        row = (flat // TILES).to(tl.int64)
+        count = tl.load(counts + flat)
+        previous = tl.load(prefix + row).to(tl.uint32)
+        mass = tl.full((16,), 0.0, tl.float32)
+        if count > CAPACITY:
+            # Uniform/tied or otherwise dense tiles retain the old full scan.
+            # Never read the uninitialized compact buffer for these tiles.
+            offset = (flat % TILES) * BLOCK + tl.arange(0, BLOCK)
+            valid = offset < VOCAB
+            value = tl.load(probs + row * VOCAB + offset, valid, other=0.0)
+            mass = _air_boundary_histogram(value, valid, previous, SHIFT)
+        elif count > 0:
+            lane = tl.arange(0, CAPACITY)
+            valid = lane < count
+            value = tl.load(
+                candidates + flat.to(tl.int64) * CAPACITY + lane, valid, other=0.0
+            )
+            mass = _air_boundary_histogram(value, valid, previous, SHIFT)
+        # Empty tiles must overwrite all bins on every pass, not reuse the
+        # previous histogram. All-zero rows still follow _air_select_kernel.
+        tl.store(histogram + flat.to(tl.int64) * 16 + bins, mass)
+
+
+@triton.jit(do_not_specialize=["ROWS"])
 def _air_kept_mass_kernel(
     probs,
     prefix,
@@ -160,12 +247,14 @@ def _air_apply_kernel(
         tl.store(output + row * VOCAB + offset, value, valid)
 
 
-def air_top_p_renorm(probs, top_ps, block_size=512):
+def air_top_p_renorm(probs, top_ps, block_size=512, *, compact=None):
     """Return a full [rows, vocab] tensor in vocabulary order, using RN division.
 
     top_ps is a clamped FP32 vector [rows] (stride zero is supported). No tensor
     values are inspected on the host. Selection retains every cutoff tie;
     output is not guaranteed bitwise identical to the sorted V1 path.
+    Compact reductions can also round differently from the full-scan AIR path.
+    Set compact=False or SGL_KERNEL_NPU_SAMPLING_AIR_COMPACT=0 for that baseline.
     """
     if probs.ndim != 2 or probs.dtype != torch.float32 or not probs.is_contiguous():
         raise ValueError("AIR requires a contiguous FP32 [rows, vocab] tensor")
@@ -199,19 +288,42 @@ def air_top_p_renorm(probs, top_ps, block_size=512):
     denominator = torch.empty((rows,), device=probs.device, dtype=torch.float32)
     grid = (min(rows * tiles, get_device_properties()[1]),)
     p_stride = top_ps.stride(0)
+    if compact is None:
+        compact = os.environ.get("SGL_KERNEL_NPU_SAMPLING_AIR_COMPACT", "1") == "1"
+    capacity = 64
+    if compact:
+        candidates = torch.empty(
+            (rows, tiles, capacity), device=probs.device, dtype=torch.float32
+        )
+        counts = torch.empty((rows, tiles), device=probs.device, dtype=torch.int32)
 
     for shift in range(28, -1, -4):
-        _air_histogram_kernel[grid](
-            probs,
-            prefix,
-            histogram,
-            rows,
-            vocab,
-            tiles,
-            shift,
-            shift == 28,
-            block_size,
-        )
+        if compact and shift < 20:
+            _air_compact_histogram_kernel[grid](
+                probs,
+                prefix,
+                candidates,
+                counts,
+                histogram,
+                rows,
+                vocab,
+                tiles,
+                shift,
+                block_size,
+                capacity,
+            )
+        else:
+            _air_histogram_kernel[grid](
+                probs,
+                prefix,
+                histogram,
+                rows,
+                vocab,
+                tiles,
+                shift,
+                shift == 28,
+                block_size,
+            )
         _air_select_kernel[(rows,)](
             histogram,
             prefix,
@@ -223,6 +335,10 @@ def air_top_p_renorm(probs, top_ps, block_size=512):
             shift,
             shift == 28,
         )
+        if compact and shift == 20:
+            _air_compact_kernel[grid](
+                probs, prefix, candidates, counts, rows, vocab, tiles, block_size, capacity
+            )
     _air_kept_mass_kernel[grid](
         probs,
         prefix,
