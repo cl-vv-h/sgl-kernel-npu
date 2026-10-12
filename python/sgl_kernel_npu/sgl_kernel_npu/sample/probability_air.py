@@ -24,12 +24,14 @@ _RADIX_BITS = 4
 _BINS = 1 << _RADIX_BITS
 
 
-@triton.jit
+# Batch changes only the runtime loop bound, not the tile layout. Avoid compiling
+# another set of radix kernels whenever the active request count changes.
+@triton.jit(do_not_specialize=["ROWS"])
 def _air_histogram_kernel(
     probs,
     prefix,
     histogram,
-    ROWS: tl.constexpr,
+    ROWS,
     VOCAB: tl.constexpr,
     TILES: tl.constexpr,
     SHIFT: tl.constexpr,
@@ -98,13 +100,13 @@ def _air_select_kernel(
     tl.store(prefix + row, old_prefix | (chosen.to(tl.uint32) << SHIFT))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _air_kept_mass_kernel(
     probs,
     prefix,
     top_ps,
     partial_sums,
-    ROWS: tl.constexpr,
+    ROWS,
     VOCAB: tl.constexpr,
     TILES: tl.constexpr,
     P_STRIDE: tl.constexpr,
@@ -132,14 +134,14 @@ def _air_denominator_kernel(
     tl.store(denominator + row, tl.maximum(tl.sum(values, 0), 1e-20))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _air_apply_kernel(
     probs,
     prefix,
     top_ps,
     denominator,
     output,
-    ROWS: tl.constexpr,
+    ROWS,
     VOCAB: tl.constexpr,
     TILES: tl.constexpr,
     P_STRIDE: tl.constexpr,
