@@ -41,6 +41,9 @@ def _air_histogram_kernel(
     BLOCK: tl.constexpr,
 ):
     bins = tl.arange(0, 16)
+    # Only bucket labels use FP16: integers 0..15 are exactly representable.
+    # Ascend materializes both comparison operands when broadcasting them.
+    compare_bins = bins.to(tl.float16)
     for flat in tl.range(tl.program_id(0), ROWS * TILES, tl.num_programs(0)):
         row = (flat // TILES).to(tl.int64)
         offset = (flat % TILES) * BLOCK + tl.arange(0, BLOCK)
@@ -51,12 +54,16 @@ def _air_histogram_kernel(
         if not FIRST:
             previous = tl.load(prefix + row).to(tl.uint32)
             valid = valid & ((key >> (SHIFT + 4)) == (previous >> (SHIFT + 4)))
-        bucket = (key >> SHIFT) & 15
+        bucket = ((key >> SHIFT) & 15).to(tl.float16)
         # Small, dense local histogram. Do not substitute a global atomic_add
         # per token: concentrated probability buckets would serialize it.
+        # Mask in one dimension before broadcasting. This avoids materializing
+        # and combining a separate [16, BLOCK] validity mask on Ascend. Values
+        # and reductions remain FP32, with the same reduction axis and order.
+        masked_value = tl.where(valid, value, 0.0)
         mass = tl.sum(
             tl.where(
-                valid[None, :] & (bins[:, None] == bucket[None, :]), value[None, :], 0.0
+                compare_bins[:, None] == bucket[None, :], masked_value[None, :], 0.0
             ),
             1,
         )
@@ -136,13 +143,14 @@ def _air_compact_kernel(
 
 @triton.jit
 def _air_boundary_histogram(value, valid, previous, SHIFT: tl.constexpr):
-    bins = tl.arange(0, 16)
+    bins = tl.arange(0, 16).to(tl.float16)
     key = value.to(tl.uint32, bitcast=True) ^ 0x7FFFFFFF
     valid = valid & ((key >> (SHIFT + 4)) == (previous >> (SHIFT + 4)))
-    bucket = (key >> SHIFT) & 15
+    bucket = ((key >> SHIFT) & 15).to(tl.float16)
+    masked_value = tl.where(valid, value, 0.0)
     return tl.sum(
         tl.where(
-            valid[None, :] & (bins[:, None] == bucket[None, :]), value[None, :], 0.0
+            bins[:, None] == bucket[None, :], masked_value[None, :], 0.0
         ),
         1,
     )
