@@ -150,3 +150,41 @@ def test_graph_replay_with_changed_inputs(probability, rows, vocab):
         graph.replay()
         torch.npu.synchronize()
         torch.testing.assert_close(actual, _reference(probs, ps, True), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tile", [512, 1024, 2048])
+@pytest.mark.parametrize("vocab", [1, 31, 513, 2048, 2051, 8193, 154880, 248320])
+def test_packed_key_merge_sort(probability, tile, vocab):
+    # Unique token keys, including high FP32 mantissa bits and odd keep bits.
+    gen = torch.Generator().manual_seed(53)
+    token = torch.arange(vocab, dtype=torch.float32) + (2**23 - vocab)
+    for order in (
+        torch.arange(vocab),
+        torch.arange(vocab - 1, -1, -1),
+        torch.randperm(vocab, generator=gen),
+    ):
+        keys = (token * 2 + (torch.arange(vocab) % 2))[order][None].npu()
+        original = keys.clone()
+        actual = probability._sort_packed_keys(keys, tile)
+        torch.testing.assert_close(actual, keys.sort(-1).values, rtol=0, atol=0)
+        torch.testing.assert_close(keys, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tile", [512, 1024, 2048])
+def test_merge_sort_graph_replay(probability, tile):
+    vocab = 8193
+    keys = (torch.arange(vocab, device="npu", dtype=torch.float32) * 2)[None]
+    for _ in range(3):
+        probability._sort_packed_keys(keys, tile)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=True):
+        actual = probability._sort_packed_keys(keys, tile)
+    for seed in (57, 58):
+        gen = torch.Generator().manual_seed(seed)
+        permutation = torch.randperm(vocab, generator=gen)
+        changed = (2 * permutation + (permutation % 2)).float()[None].npu()
+        keys.copy_(changed)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual, keys.sort(-1).values, rtol=0, atol=0)
