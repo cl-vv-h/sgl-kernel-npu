@@ -74,6 +74,39 @@ def test_fused_renorm_shared_sort(probability, rows, vocab, top_p, scalar):
     torch.testing.assert_close(probs, original, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("top_p", [False, True])
+def test_int32_key_sort_and_restore(probability, monkeypatch, top_p):
+    probs = torch.tensor([[0.25, 0.0625, 0.5, 0.1875]], device="npu")
+    values, indices = probs.sort(dim=-1, descending=True)
+    threshold = torch.tensor([0.6] if top_p else [2], device="npu")
+    cumulative = values.cumsum(-1) if top_p else None
+    expected = _reference(probs, threshold, top_p)
+    native_sort = torch.Tensor.sort
+    sorted_keys = []
+
+    def sort_int32_keys(tensor, *args, **kwargs):
+        # Verify the actual sort input, not just integer arithmetic in the kernel.
+        assert tensor.dtype == torch.int32
+        result = native_sort(tensor, *args, **kwargs)
+        assert result.values.dtype == torch.int32
+        sorted_keys.append(result.values)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "sort", sort_int32_keys)
+        actual = probability.filter_and_renorm(
+            probs, values, indices, threshold, cumulative
+        )
+    assert len(sorted_keys) == 1
+    torch.testing.assert_close(
+        sorted_keys[0],
+        torch.tensor([[1, 2, 5, 6]], device="npu", dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("scalar_kind", ["python", "tensor", "rows"])
 def test_public_top_k_then_top_p(probability, scalar_kind):
     probs = torch.arange(1, 195, dtype=torch.float32, device="npu").reshape(2, 97)

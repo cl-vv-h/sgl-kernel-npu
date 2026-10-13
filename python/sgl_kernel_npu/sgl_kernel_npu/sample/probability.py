@@ -1,7 +1,7 @@
 """Top-k/top-p renormalization using fused filtering and RN restoration.
 
-The only implementation is the packed-key Triton path for NPU FP32
-probabilities. There is no environment-controlled dispatch or scatter fallback.
+The only implementation uses INT32 packed keys and NPU FP32 probabilities.
+There is no environment-controlled dispatch or scatter fallback.
 """
 
 from typing import Union
@@ -19,8 +19,9 @@ def _prepare_probs(probs: torch.Tensor) -> torch.Tensor:
         raise ValueError("probs must use torch.float32")
     if probs.device.type != "npu":
         raise ValueError("probs must be on an NPU")
+    # Keep the V1 vocabulary limit for this experiment; all keys fit in INT32.
     if not 1 <= probs.shape[1] <= 2**23:
-        raise ValueError("probs must have vocab_size in [1, 2**23] for exact FP32 keys")
+        raise ValueError("probs must have vocab_size in [1, 2**23]")
     return probs.contiguous()
 
 
@@ -59,7 +60,7 @@ def _filter_encode_kernel(
         valid = offsets < V
         address = row * V + offsets
         value = tl.load(values + address, valid, other=0.0)
-        token = tl.load(indices + address, valid, other=0)
+        token = tl.load(indices + address, valid, other=0).to(tl.int32)
         if TOP_P:
             threshold = tl.load(thresholds + row * THRESHOLD_STRIDE)
             prefix = tl.load(cumulative + address, valid, other=0.0)
@@ -72,9 +73,8 @@ def _filter_encode_kernel(
             threshold = tl.load(thresholds + row * THRESHOLD_STRIDE)
             value = tl.where(offsets >= threshold, 0.0, value)
             tl.store(values + address, value, valid)
-        # Encode with integer arithmetic; the FP32 key buffer converts on store.
-        # V <= 2**23 keeps every stored key exactly representable in FP32.
-        key = token * 2 + (value != 0.0).to(tl.int64)
+        # Encode and store INT32 keys; no floating-point key conversion.
+        key = token * 2 + (value != 0.0).to(tl.int32)
         tl.store(keys + address, key, valid)
 
 
@@ -95,8 +95,8 @@ def _restore_kernel(
         valid = offsets < V
         address = row * V + offsets
         value = tl.load(probs + address, valid, other=0.0)
-        key = tl.load(ordered_keys + address, valid, other=0.0)
-        # Keep token-position arithmetic integer; comparison promotes to FP32.
+        key = tl.load(ordered_keys + address, valid, other=0)
+        # Both the sorted key and token-position comparison use INT32.
         removed = key == offsets * 2
         value = tl.where(removed, 0.0, value)
         scale = tl.load(denominator + row)
@@ -120,7 +120,7 @@ def filter_and_renorm(
         return torch.empty_like(probs)
     blocks = triton.cdiv(vocab, 2048)
     grid = (min(rows * blocks, get_device_properties()[1]),)
-    keys = torch.empty_like(sorted_values)
+    keys = torch.empty_like(sorted_values, dtype=torch.int32)
     _filter_encode_kernel[grid](
         sorted_values,
         sorted_indices,
@@ -135,7 +135,7 @@ def filter_and_renorm(
         2048,
     )
     denominator = sorted_values.sum(dim=-1, keepdim=True).clamp_min_(1e-20)
-    # Sort exact FP32 token keys; discard sort indices. This avoids the slow
+    # Sort INT32 token keys; discard sort indices. This avoids the slow
     # full-vocabulary scatter while retaining the native probability-sort ties.
     ordered_keys = keys.sort(dim=-1).values
     output = torch.empty_like(probs)
