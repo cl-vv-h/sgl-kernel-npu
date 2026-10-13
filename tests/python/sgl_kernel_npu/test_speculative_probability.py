@@ -1,4 +1,4 @@
-"""NPU correctness and graph tests for the fixed fused RN implementation."""
+"""NPU correctness and graph tests for V1 and independent sampling experiments."""
 
 import importlib
 
@@ -7,11 +7,14 @@ import torch
 
 
 @pytest.fixture
-def probability():
+def probability(monkeypatch):
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("NPU is not available")
-    return importlib.import_module("sgl_kernel_npu.sample.probability")
+    module = importlib.import_module("sgl_kernel_npu.sample.probability")
+    monkeypatch.setattr(module, "_BOUNDARY_RESTORE", False)
+    monkeypatch.setattr(module, "_SCAN_FUSION", False)
+    return module
 
 
 def _reference(probs, threshold, top_p):
@@ -39,7 +42,11 @@ def _reference(probs, threshold, top_p):
 )
 @pytest.mark.parametrize("top_p", [False, True])
 @pytest.mark.parametrize("scalar", [False, True])
-def test_fused_renorm_shared_sort(probability, rows, vocab, top_p, scalar):
+@pytest.mark.parametrize("boundary_restore", [False, True])
+def test_fused_renorm_shared_sort(
+    probability, monkeypatch, rows, vocab, top_p, scalar, boundary_restore
+):
+    monkeypatch.setattr(probability, "_BOUNDARY_RESTORE", boundary_restore)
     gen = torch.Generator().manual_seed(17)
     probs = torch.softmax(torch.randn(rows, vocab, generator=gen), -1).npu()
     probs[0].fill_(1.0 / vocab)
@@ -72,6 +79,72 @@ def test_fused_renorm_shared_sort(probability, rows, vocab, top_p, scalar):
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(probs, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("scan_fusion", [False, True])
+@pytest.mark.parametrize("boundary_restore", [False, True])
+def test_public_switch_combinations(
+    probability, monkeypatch, scan_fusion, boundary_restore
+):
+    monkeypatch.setattr(probability, "_SCAN_FUSION", scan_fusion)
+    monkeypatch.setattr(probability, "_BOUNDARY_RESTORE", boundary_restore)
+    # Binary-exact probabilities isolate dispatch from scan rounding differences.
+    probs = torch.tensor(
+        [[0.5, 0.25, 0.125, 0.125], [0.0, 0.0, 0.0, 0.0]], device="npu"
+    )
+    ps = torch.tensor([0.6, 0.95], device="npu")
+    actual = probability.top_p_renorm_prob(probs, ps)
+    torch.testing.assert_close(actual, _reference(probs, ps, True), rtol=0, atol=0)
+    # Scan fusion does not affect top-k; boundary restoration can affect it.
+    ks = torch.tensor([2, 4], device="npu")
+    torch.testing.assert_close(
+        probability.top_k_renorm_prob(probs, ks),
+        _reference(probs, ks, False),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("rows,vocab", [(7, 2051), (7, 248320), (216, 248320)])
+@pytest.mark.parametrize("scalar", [False, True])
+def test_scan_boundary_matches_scan_packed(probability, rows, vocab, scalar):
+    gen = torch.Generator().manual_seed(41)
+    probs = torch.softmax(torch.randn(rows, vocab, generator=gen), -1).npu()
+    probs[0].fill_(1.0 / vocab)
+    probs[1].zero_()
+    probs[2] *= 1e-25
+    original = probs.clone()
+    values, indices = probs.sort(-1, descending=True)
+    ps = torch.tensor([0, 1, 0.95, 0.5, 0.25, 0.95, 0.95], device="npu")
+    ps = ps.repeat((rows + 6) // 7)[:rows]
+    if scalar:
+        ps = ps[3].expand(rows)
+    # Both paths use the same tiled scan; this tests restoration, not a claim
+    # of universal equivalence between tiled scan and native cumsum.
+    expected = probability._renorm_sorted_experimental(
+        probs, values.clone(), indices, ps, scan_fusion=True
+    )
+    actual = probability._renorm_sorted_experimental(
+        probs, values.clone(), indices, ps, scan_fusion=True, boundary_restore=True
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(probs, original, rtol=0, atol=0)
+
+
+def test_boundary_handles_nonprefix_selection(probability):
+    # Restoration also covers non-prefix keep sets, not just a single tie group.
+    probs = torch.tensor([[0.125, 0.5, 0.0625, 0.25, 0.03125]], device="npu")
+    values, indices = probs.sort(-1, descending=True)
+    exclusive = torch.tensor([[0.0, 1.0, 0.0, 1.0, 0.0]], device="npu")
+    cumulative = values + exclusive
+    ps = torch.tensor([0.5], device="npu")
+    expected = probability._filter_and_renorm_v1(
+        probs, values.clone(), indices, ps, cumulative
+    )
+    actual = probability._renorm_sorted_experimental(
+        probs, values.clone(), indices, ps, cumulative, boundary_restore=True
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("scalar_kind", ["python", "tensor", "rows"])
@@ -131,7 +204,15 @@ def test_validation_and_empty_batch(probability):
 
 
 @pytest.mark.parametrize("rows,vocab", [(4, 2051), (216, 154880), (216, 248320)])
-def test_graph_replay_with_changed_inputs(probability, rows, vocab):
+@pytest.mark.parametrize(
+    "boundary_restore,scan_fusion",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_graph_replay_with_changed_inputs(
+    probability, monkeypatch, rows, vocab, boundary_restore, scan_fusion
+):
+    monkeypatch.setattr(probability, "_BOUNDARY_RESTORE", boundary_restore)
+    monkeypatch.setattr(probability, "_SCAN_FUSION", scan_fusion)
     probs = torch.softmax(torch.randn(rows, vocab, device="npu"), -1)
     ps = torch.tensor([0, 0.5, 0.95, 1], device="npu").repeat((rows + 3) // 4)[:rows]
     stream = torch.npu.Stream()
@@ -149,4 +230,11 @@ def test_graph_replay_with_changed_inputs(probability, rows, vocab):
         torch.npu.synchronize()
         graph.replay()
         torch.npu.synchronize()
-        torch.testing.assert_close(actual, _reference(probs, ps, True), rtol=0, atol=0)
+        if scan_fusion:
+            values, indices = probs.sort(-1, descending=True)
+            expected = probability._renorm_sorted_experimental(
+                probs, values, indices, ps, scan_fusion=True
+            )
+        else:
+            expected = _reference(probs, ps, True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
