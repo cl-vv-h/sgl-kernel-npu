@@ -150,3 +150,94 @@ def test_graph_replay_with_changed_inputs(probability, rows, vocab):
         graph.replay()
         torch.npu.synchronize()
         torch.testing.assert_close(actual, _reference(probs, ps, True), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tile", [256, 512, 1024])
+@pytest.mark.parametrize("vocab", [1, 31, 513, 2051, 8193, 154880, 248320])
+@pytest.mark.parametrize("ties", [False, True])
+def test_probability_sort_int32(probability, tile, vocab, ties, record_property):
+    gen = torch.Generator().manual_seed(81)
+    x = torch.rand(2, vocab, generator=gen)
+    if ties:
+        x = (x * 8).floor()
+    probs = x.npu()
+    original = probs.clone()
+    values, indices, totals = probability._sort_probabilities_int32(probs, tile, True)
+    expected_values, expected_indices = torch.sort(
+        x, dim=-1, descending=True, stable=True
+    )
+    assert indices.dtype == torch.int32
+    torch.testing.assert_close(values, expected_values.npu(), rtol=0, atol=0)
+    torch.testing.assert_close(indices.long(), expected_indices.npu(), rtol=0, atol=0)
+    torch.testing.assert_close(probs, original, rtol=0, atol=0)
+    # Native unstable identities can differ inside ties; explicitly record this
+    # instead of treating a stable-sort oracle as proof of V1 equivalence.
+    native_values, native_indices = probs.sort(-1, descending=True)
+    torch.testing.assert_close(values, native_values, rtol=0, atol=0)
+    record_property(
+        "native_identity_mismatches", (indices != native_indices).sum().item()
+    )
+    expected_totals = torch.stack(
+        [values[:, start : start + tile].sum(-1) for start in range(0, vocab, tile)], -1
+    )
+    torch.testing.assert_close(totals, expected_totals, rtol=2e-6, atol=0)
+
+
+def _native_reference_for_scan(probs, ps):
+    values, indices = probs.sort(dim=-1, descending=True)
+    values.masked_fill_(values.cumsum(-1) - values > ps[:, None], 0)
+    values.div_(values.sum(-1, keepdim=True).clamp_min_(1e-20))
+    return torch.zeros_like(probs).scatter_(-1, indices, values)
+
+
+@pytest.mark.parametrize("tile", [512, 1024, 2048])
+def test_fused_scan_exact_binary_probabilities(probability, tile):
+    # Dyadic probabilities eliminate summation-order error, isolating indexing,
+    # carry propagation, threshold endpoints, zeros and high-ID one-hot tokens.
+    probs = torch.full((4, 2051), 1 / 4096, device="npu")
+    probs[1].zero_()
+    probs[2].zero_()
+    probs[2, -1] = 1
+    ps = torch.tensor([0, 1, 0.95, 0.5], device="npu")
+    expected = _native_reference_for_scan(probs, ps)
+    actual = probability._top_p_renorm_prob_scan_fused(probs, ps, tile)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fused_scan_graph_replay(probability):
+    probs = torch.full((2, 2051), 1 / 4096, device="npu")
+    ps = torch.tensor([0.95, 0.5], device="npu")
+    for _ in range(3):
+        probability._top_p_renorm_prob_scan_fused(probs, ps)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, auto_dispatch_capture=True):
+        actual = probability._top_p_renorm_prob_scan_fused(probs, ps)
+    for token in (0, 2050):
+        probs.zero_()
+        probs[:, token] = 1
+        ps.copy_(torch.tensor([0, 1], device="npu"))
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(
+            actual, _native_reference_for_scan(probs, ps), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("tile", [256, 512, 1024])
+def test_int32_sort_full_top_p(probability, tile):
+    gen = torch.Generator().manual_seed(101)
+    x = torch.rand(3, 2051, generator=gen)
+    x /= x.sum(-1, keepdim=True)
+    x[0].fill_(1 / 4096)
+    probs = x.npu()
+    ps = torch.tensor([0, 0.95, 1], device="npu")
+    # Oracle explicitly uses token-ID ordering inside ties. This test validates
+    # the new order, not equivalence to native unstable tie identities.
+    values, indices = x.sort(dim=-1, descending=True, stable=True)
+    values, indices = values.npu(), indices.npu()
+    expected = probability.filter_and_renorm(
+        probs, values, indices, ps, values.cumsum(-1)
+    )
+    actual = probability._top_p_renorm_prob_sort_int32(probs, ps, tile)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
