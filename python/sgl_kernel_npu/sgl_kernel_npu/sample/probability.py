@@ -59,7 +59,7 @@ def _filter_encode_kernel(
         valid = offsets < V
         address = row * V + offsets
         value = tl.load(values + address, valid, other=0.0)
-        token = tl.load(indices + address, valid, other=0).to(tl.float32)
+        token = tl.load(indices + address, valid, other=0)
         if TOP_P:
             threshold = tl.load(thresholds + row * THRESHOLD_STRIDE)
             prefix = tl.load(cumulative + address, valid, other=0.0)
@@ -72,8 +72,9 @@ def _filter_encode_kernel(
             threshold = tl.load(thresholds + row * THRESHOLD_STRIDE)
             value = tl.where(offsets >= threshold, 0.0, value)
             tl.store(values + address, value, valid)
-        # V <= 2**23 makes every encoded integer exactly representable in FP32.
-        key = token * 2.0 + (value != 0.0).to(tl.float32)
+        # Encode with integer arithmetic; the FP32 key buffer converts on store.
+        # V <= 2**23 keeps every stored key exactly representable in FP32.
+        key = token * 2 + (value != 0.0).to(tl.int64)
         tl.store(keys + address, key, valid)
 
 
@@ -95,7 +96,8 @@ def _restore_kernel(
         address = row * V + offsets
         value = tl.load(probs + address, valid, other=0.0)
         key = tl.load(ordered_keys + address, valid, other=0.0)
-        removed = key == offsets.to(tl.float32) * 2.0
+        # Keep token-position arithmetic integer; comparison promotes to FP32.
+        removed = key == offsets * 2
         value = tl.where(removed, 0.0, value)
         scale = tl.load(denominator + row)
         # Fixed round-to-nearest division; never replace with rcp * x.
