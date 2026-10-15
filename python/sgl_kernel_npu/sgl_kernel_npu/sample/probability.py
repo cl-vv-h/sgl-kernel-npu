@@ -216,8 +216,12 @@ def _experimental_filter_kernel(
             b = tl.max(
                 tl.where(valid & (value > 0.0) & (retained == 0.0), value, 0.0), 0
             )
-            tl.store(auxiliary + flat * 2, a)
-            tl.store(auxiliary + flat * 2 + 1, b)
+            # Use aligned, contiguous planes for the metadata reductions.
+            # Interleaved pairs produce masked stride-2 copies in BiSheng IR.
+            bound_stride: tl.constexpr = triton.next_power_of_2(NB)
+            base = row * (2 * bound_stride) + tile
+            tl.store(auxiliary + base, a)
+            tl.store(auxiliary + base + bound_stride, b)
         else:
             token = tl.load(indices + address, valid, other=0).to(tl.float32)
             key = token * 2.0 + (retained != 0.0).to(tl.float32)
@@ -236,9 +240,9 @@ def _boundary_metadata_kernel(
     valid = tile < NB
     for row_index in tl.range(tl.program_id(0), ROWS, tl.num_programs(0)):
         row = row_index.to(tl.int64)
-        base = row * NB * 2 + tile * 2
+        base = row * (2 * PAD) + tile
         local_a = tl.load(bounds + base, valid, other=float("inf"))
-        b = tl.max(tl.load(bounds + base + 1, valid, other=0.0), 0)
+        b = tl.max(tl.load(bounds + base + PAD, valid, other=0.0), 0)
         # A block needs repair iff it contains a positive retained value <= b.
         # When every retained value is above b, begin > end skips row repair.
         needs_correction = valid & (local_a <= b)
@@ -343,7 +347,11 @@ def _renorm_sorted_experimental(
     else:
         prefixes = cumulative if cumulative is not None else sorted_values
     auxiliary = (
-        torch.empty((rows, blocks, 2), device=probs.device, dtype=torch.float32)
+        torch.empty(
+            (rows, 2, triton.next_power_of_2(blocks)),
+            device=probs.device,
+            dtype=torch.float32,
+        )
         if boundary_restore
         else torch.empty_like(sorted_values)
     )
