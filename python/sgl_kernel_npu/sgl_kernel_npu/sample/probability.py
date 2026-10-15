@@ -197,10 +197,6 @@ def _experimental_filter_kernel(
         valid = position < V
         address = row * V + position
         value = tl.load(values + address, valid, other=0.0)
-        if BOUNDARY_RESTORE:
-            # Read the original sorted block edges before overwriting values.
-            first = tl.load(values + row * V + tile * BLOCK)
-            last = tl.load(values + row * V + tl.minimum((tile + 1) * BLOCK, V) - 1)
         threshold = tl.load(thresholds + row * THRESHOLD_STRIDE)
         if TOP_P:
             if SCAN_FUSION:
@@ -213,17 +209,15 @@ def _experimental_filter_kernel(
             retained = tl.where(position >= threshold, 0.0, value)
         tl.store(values + address, retained, valid)
         if BOUNDARY_RESTORE:
-            # All incorrect threshold-only decisions lie in [a, max(a, b)],
-            # where a is the minimum positive kept value and b the maximum
-            # positive removed value. Collect them during the existing filter.
+            # Restoring probabilities above the row's maximum removed value
+            # never restores a removed token. The block's minimum positive
+            # retained value identifies whether any retained tokens need repair.
             a = tl.min(tl.where(valid & (retained > 0.0), value, float("inf")), 0)
             b = tl.max(
                 tl.where(valid & (value > 0.0) & (retained == 0.0), value, 0.0), 0
             )
-            tl.store(auxiliary + flat * 4, a)
-            tl.store(auxiliary + flat * 4 + 1, b)
-            tl.store(auxiliary + flat * 4 + 2, first)
-            tl.store(auxiliary + flat * 4 + 3, last)
+            tl.store(auxiliary + flat * 2, a)
+            tl.store(auxiliary + flat * 2 + 1, b)
         else:
             token = tl.load(indices + address, valid, other=0).to(tl.float32)
             key = token * 2.0 + (retained != 0.0).to(tl.float32)
@@ -242,20 +236,17 @@ def _boundary_metadata_kernel(
     valid = tile < NB
     for row_index in tl.range(tl.program_id(0), ROWS, tl.num_programs(0)):
         row = row_index.to(tl.int64)
-        base = row * NB * 4 + tile * 4
-        a = tl.min(tl.load(bounds + base, valid, other=float("inf")), 0)
+        base = row * NB * 2 + tile * 2
+        local_a = tl.load(bounds + base, valid, other=float("inf"))
         b = tl.max(tl.load(bounds + base + 1, valid, other=0.0), 0)
-        first = tl.load(bounds + base + 2, valid, other=0.0)
-        last = tl.load(bounds + base + 3, valid, other=0.0)
-        intersects = (
-            valid & (a < float("inf")) & (first >= a) & (last <= tl.maximum(a, b))
-        )
-        begin = tl.min(tl.where(intersects, tile, NB), 0)
-        end = tl.max(tl.where(intersects, tile + 1, 0), 0)
-        tl.store(metadata + row * 4, a)
+        # A block needs repair iff it contains a positive retained value <= b.
+        # When every retained value is above b, begin > end skips row repair.
+        needs_correction = valid & (local_a <= b)
+        begin = tl.min(tl.where(needs_correction, tile, NB), 0)
+        end = tl.max(tl.where(needs_correction, tile + 1, 0), 0)
+        tl.store(metadata + row * 4, b)
         tl.store(metadata + row * 4 + 1, begin.to(tl.float32))
         tl.store(metadata + row * 4 + 2, end.to(tl.float32))
-        tl.store(metadata + row * 4 + 3, b)
 
 
 @triton.jit(do_not_specialize=["ROWS"])
@@ -276,6 +267,8 @@ def _boundary_restore_kernel(
         valid = position < V
         cutoff = tl.load(metadata + row * 4)
         value = tl.load(probs + row * V + position, valid, other=0.0)
+        # No removed positive probability exceeds cutoff. Only retained values
+        # at or below cutoff are missing and will be restored by row repair.
         value = tl.where(value > cutoff, value, 0.0)
         value = tl.div_rn(value, tl.load(denominator + row))
         tl.store(output + row * OUTPUT_STRIDE + position, value, valid)
@@ -300,17 +293,19 @@ def _boundary_correct_kernel(
         row = row_index.to(tl.int64)
         begin = tl.load(metadata + row * 4 + 1).to(tl.int32)
         end = tl.load(metadata + row * 4 + 2).to(tl.int32)
+        cutoff = tl.load(metadata + row * 4)
         scale = tl.load(denominator + row)
         for tile in tl.range(begin, end):
             position = tile * BLOCK + lane
             valid = position < V
             address = row * V + position
-            # Correct the entire intersecting block, using the actual native
-            # sort permutation and filtered values. No second probability scan.
+            # Keep the native sort's tie identities. Only positive retained
+            # values missed by threshold restoration need indexed loads/stores.
             value = tl.load(values + address, valid, other=0.0)
-            token = tl.load(indices + address, valid, other=0)
+            needs_correction = valid & (value > 0.0) & (value <= cutoff)
+            token = tl.load(indices + address, needs_correction, other=0)
             value = tl.div_rn(value, scale)
-            tl.store(output + row * OUTPUT_STRIDE + token, value, valid)
+            tl.store(output + row * OUTPUT_STRIDE + token, value, needs_correction)
 
 
 def _renorm_sorted_experimental(
@@ -348,7 +343,7 @@ def _renorm_sorted_experimental(
     else:
         prefixes = cumulative if cumulative is not None else sorted_values
     auxiliary = (
-        torch.empty((rows, blocks, 4), device=probs.device, dtype=torch.float32)
+        torch.empty((rows, blocks, 2), device=probs.device, dtype=torch.float32)
         if boundary_restore
         else torch.empty_like(sorted_values)
     )
@@ -375,6 +370,7 @@ def _renorm_sorted_experimental(
             probs, ordered_keys, denominator, output, rows, vocab, blocks, block
         )
         return output
+    # Three fields (cutoff, begin, end), with a padded four-element row stride.
     metadata = torch.empty((rows, 4), device=probs.device, dtype=torch.float32)
     _boundary_metadata_kernel[row_grid](
         auxiliary, metadata, rows, blocks, triton.next_power_of_2(blocks)
