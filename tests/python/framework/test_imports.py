@@ -8,6 +8,7 @@ from unittest.mock import Mock, sentinel
 import pytest
 
 
+# Verify checkout public exports and operator registration share the checkout registry.
 def test_checked_out_public_api_uses_the_same_registry(operator_modules, npu_runtime):
     registry = operator_modules.registry
     rmsnorm_bias = operator_modules.import_module("operators.norm").rmsnorm_bias
@@ -23,6 +24,7 @@ def test_checked_out_public_api_uses_the_same_registry(operator_modules, npu_run
     )
 
 
+# Verify public imports register once without importing backend kernel modules.
 def test_public_import_registers_without_importing_kernel_leaves(operator_modules):
     norm = operator_modules.import_module("operators.norm")
     module = operator_modules.import_module("operators.norm.rmsnorm_bias")
@@ -40,6 +42,7 @@ def test_public_import_registers_without_importing_kernel_leaves(operator_module
     assert registry.list_impls(norm.rmsnorm_bias) == ["auto", "torch_native", "triton"]
 
 
+# Verify hardware detection failure aborts registry import without caching a partial module.
 def test_hardware_detection_failure_aborts_registry_import(
     package_factory, monkeypatch
 ):
@@ -54,6 +57,7 @@ def test_hardware_detection_failure_aborts_registry_import(
     assert f"{package.namespace}.operators.utils.registry" not in sys.modules
 
 
+# Verify private registrations do not affect other registries or the installed package.
 def test_private_registrations_do_not_leak_to_other_modules(
     package_factory, npu_runtime
 ):
@@ -77,6 +81,7 @@ def test_private_registrations_do_not_leak_to_other_modules(
     } == installed_modules
 
 
+# Verify checkout operators work when the installed runtime has no operators package.
 def test_checkout_framework_does_not_require_installed_operators(
     package_factory, monkeypatch
 ):
@@ -92,6 +97,7 @@ def test_checkout_framework_does_not_require_installed_operators(
     )
 
 
+# Verify missing dependencies affect only the selected backend and permit a later retry.
 @pytest.mark.parametrize("missing_impl", ["triton", "torch_native"])
 def test_missing_backend_is_isolated_and_failed_import_can_retry(
     operator_modules, rmsnorm_module, kernels, monkeypatch, missing_impl

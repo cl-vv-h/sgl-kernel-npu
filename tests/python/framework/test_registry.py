@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 
+# Verify public registration preserves function identity and never executes it.
 def test_public_registration_preserves_function(registry):
     operator = Mock()
 
@@ -13,6 +14,7 @@ def test_public_registration_preserves_function(registry):
     operator.assert_not_called()
 
 
+# Verify the registered operator name is explicit, not inferred from the function name.
 def test_operator_name_is_explicit_not_inferred(registry):
     def misleading_name():
         pass
@@ -21,6 +23,7 @@ def test_operator_name_is_explicit_not_inferred(registry):
     assert registry.get_op_name(misleading_name) == "norm.custom_name"
 
 
+# Verify re-registering a public function fails without changing its original name.
 def test_duplicate_public_function_is_rejected_without_changing_name(registry):
     operator = Mock()
     registry.register_operator("test.first")(operator)
@@ -31,6 +34,7 @@ def test_duplicate_public_function_is_rejected_without_changing_name(registry):
     assert registry.get_op_name(operator) == "test.first"
 
 
+# Verify a duplicate public name is rejected without registering the new function.
 def test_duplicate_public_name_is_rejected_without_registering_function(registry):
     original, duplicate = Mock(), Mock()
     registry.register_operator("test.op")(original)
@@ -43,6 +47,7 @@ def test_duplicate_public_name_is_rejected_without_registering_function(registry
         registry.get_op_name(duplicate)
 
 
+# Verify lookup and enumeration reject unregistered public functions.
 @pytest.mark.parametrize("query", ["get_op_name", "get_impl", "list_impls"])
 def test_unregistered_function_is_rejected(registry, query):
     operator = Mock()
@@ -54,6 +59,7 @@ def test_unregistered_function_is_rejected(registry, query):
     operator.assert_not_called()
 
 
+# Verify registration and both lookup APIs return the backend without executing it.
 def test_impl_registration_and_lookup_do_not_execute_backend(registry):
     operator, backend = Mock(), Mock()
     registry.register_operator("test.op")(operator)
@@ -64,6 +70,7 @@ def test_impl_registration_and_lookup_do_not_execute_backend(registry):
     backend.assert_not_called()
 
 
+# Verify an implementation can be registered before its public operator.
 def test_impl_can_be_registered_before_public_operator(registry):
     operator, backend = Mock(), Mock()
     registry.register_impl("test.op", "triton")(backend)
@@ -72,6 +79,7 @@ def test_impl_can_be_registered_before_public_operator(registry):
     assert registry.get_impl(operator, "triton") is backend
 
 
+# Verify duplicate implementation keys are rejected without overwriting the original entry.
 @pytest.mark.parametrize("reuse_callable", [False, True])
 def test_duplicate_impl_is_rejected_without_overwriting(registry, reuse_callable):
     original, replacement = Mock(), Mock()
@@ -86,6 +94,7 @@ def test_duplicate_impl_is_rejected_without_overwriting(registry, reuse_callable
     replacement.assert_not_called()
 
 
+# Verify identical implementation names resolve independently for different operators.
 def test_same_impl_name_is_scoped_to_operator(registry):
     first, second = Mock(), Mock()
     registry.register_impl("test.first", "triton")(first)
@@ -95,6 +104,7 @@ def test_same_impl_name_is_scoped_to_operator(registry):
     assert registry.get_impl_by_name("test.second", "triton") is second
 
 
+# Verify implementation aliases resolve to the same callable and remain enumerable.
 def test_aliases_preserve_callable_identity(registry):
     operator, backend = Mock(), Mock()
     registry.register_operator("test.op")(operator)
@@ -105,6 +115,7 @@ def test_aliases_preserve_callable_identity(registry):
     assert registry.list_impls(operator) == ["auto", "triton"]
 
 
+# Verify enumeration is sorted, operator-specific, and unaffected by modifying its result.
 def test_list_impls_is_sorted_and_excludes_other_operators(registry):
     operator = Mock()
     registry.register_operator("test.op")(operator)
@@ -121,6 +132,7 @@ def test_list_impls_is_sorted_and_excludes_other_operators(registry):
     assert registry.list_impls(operator) == expected
 
 
+# Verify an operator with no implementations has an empty listing and fails lookup.
 def test_registered_operator_without_impls_has_no_choices(registry):
     operator = Mock()
     registry.register_operator("test.op")(operator)
@@ -130,12 +142,14 @@ def test_registered_operator_without_impls_has_no_choices(registry):
         registry.get_impl(operator, "auto")
 
 
+# Verify an unknown operator name has an empty listing and fails implementation lookup.
 def test_unknown_name_has_no_choices(registry):
     assert registry.list_impls_by_name("test.missing") == []
     with pytest.raises(registry.ImplementationNotFoundError, match=r"declared: \[\]"):
         registry.get_impl_by_name("test.missing", "triton")
 
 
+# Verify an unknown implementation reports declared choices without falling back.
 @pytest.mark.parametrize("impl", ["missing", "TRITON", "", None])
 def test_unknown_impl_reports_choices_without_fallback(registry, impl):
     operator, backend = Mock(), Mock()
@@ -153,6 +167,7 @@ def test_unknown_impl_reports_choices_without_fallback(registry, impl):
     backend.assert_not_called()
 
 
+# Verify exported lookup functions use the same registry as implementation registration.
 def test_public_exports_use_the_same_registry(operator_modules):
     api, registry = operator_modules.public_api, operator_modules.registry
     operator, backend = Mock(), Mock()
