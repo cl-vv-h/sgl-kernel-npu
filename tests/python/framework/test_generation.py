@@ -31,7 +31,7 @@ def test_real_npu_is_identified(npu_runtime, generation_module):
     assert hardware.generation is generation_module.generation_from_soc(
         hardware.soc_name
     )
-    assert hardware.generation.value == npu_runtime.hardware.generation.value
+    assert hardware.soc_name == npu_runtime.soc_name
 
 
 def test_successful_detection_is_cached(npu_runtime, generation_module, monkeypatch):

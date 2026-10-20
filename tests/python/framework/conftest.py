@@ -43,31 +43,13 @@ def npu_runtime(request):
             / "sgl_kernel_npu"
             / "sgl_kernel_npu"
         )
-        # Prevent a passing run against an older installed Python framework.
-        installed = Path(package.__file__).resolve().parent
-        for file in sorted((source / "operators").rglob("*.py")):
-            relative = file.relative_to(source)
-            installed_file = installed / relative
-            if (
-                not installed_file.is_file()
-                or installed_file.read_bytes() != file.read_bytes()
-            ):
-                pytest.fail(
-                    f"Installed framework differs from this checkout: {relative}. "
-                    "Build/install this branch before running framework UT.",
-                    pytrace=False,
-                )
-        public_api = importlib.import_module("sgl_kernel_npu.operators")
-        generation = importlib.import_module(
-            "sgl_kernel_npu.operators.utils.generation"
-        )
-        hardware = generation.get_hardware()
+        # The installed package supplies the native runtime, not the Python
+        # framework under test. package_factory loads operators from checkout;
+        # an older installed package need not contain operators at all.
         yield SimpleNamespace(
             torch=torch,
             package=package,
-            public_api=public_api,
-            generation=generation,
-            hardware=hardware,
+            soc_name=torch.npu.get_device_name(),
             source=source,
         )
     finally:

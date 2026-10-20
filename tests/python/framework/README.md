@@ -7,7 +7,9 @@
 ## 环境和运行
 
 使用 Python 3.10+、pytest、匹配的 PyTorch/torch_npu/CANN 和可用的 Ascend NPU。
-先按仓库构建说明安装本分支的 `sgl_kernel_npu`（含原生 `.so`），然后在仓库根目录执行：
+环境中需要可正常导入的 `sgl_kernel_npu`（含兼容的原生 `.so`），然后在仓库根目录执行。
+Python 框架统一从当前 checkout 加载；已安装包可以尚未包含新 operators，
+不要求其 Python 文件与本分支逐字节相同，也无需仅为此次 Python UT 更新而重编原生库：
 
 ```bash
 python -m pytest tests/python/framework -v -rs -x --npu-device=0
@@ -31,8 +33,8 @@ python -m pytest tests/python/framework --collect-only -q
 ```
 
 这里的环境缺失、包导入失败、`.so` 加载失败、未知 SoC 都应报告为错误，不以整批 skip
-掩盖环境问题。测试会检查已安装的 operators Python 文件与当前 checkout 一致，防止误测旧包。
-若出现 `Installed framework differs from this checkout`，请安装当前分支后重试。
+掩盖环境问题。框架测试使用当前 checkout 的源码，不从 site-packages 导入 operators，
+也不改写已安装包的搜索路径。
 
 ## 用例组成
 
@@ -42,15 +44,16 @@ python -m pytest tests/python/framework --collect-only -q
 | test_dispatch.py | 14 | 真实 RMSNorm 公共入口、默认/显式 impl、参数透传、错误不回退、新实现动态接入、缓存路由隔离 |
 | test_generation.py | 10 | 真实硬件识别、A2/A3/A5 型号映射、未知型号、成功缓存和失败重试 |
 | test_generation_registry.py | 17 | 支持/排除集合、空集合、类型校验、当前代际分类、别名范围一致性和注册原子性 |
-| test_imports.py | 6 | 安装包公共导出、模块导入注册、不提前导入 kernel、检测失败、注册隔离、缺依赖与恢复 |
-| 合计 | 68 | 数量来自 pytest collection，不表示已执行通过 |
+| test_imports.py | 7 | checkout 公共导出、模块导入注册、不提前导入 kernel、检测失败、注册隔离、缺依赖与恢复、旧安装包兼容 |
+| 合计 | 69 | 数量来自 pytest collection，不表示已执行通过 |
 
 不同 backend 的路由、参数方式和异常分别测试，没有把所有维度做笛卡尔乘积。
 `test_backend` 是人为注册的替身，用于验证扩展机制，不是一个真实算子实现。
 
 ## fixture 与 mock 边界
 
-1. session fixture 真实检查 NPU，选择设备，正常导入安装包及其原生库，并识别实际硬件。
+1. session fixture 真实检查 NPU，选择设备，正常导入安装包及其原生库，读取实际设备名称。
+   代际映射和注册判断在当前 checkout 的 generation/registry 中执行。
 2. 每条 UT 在私有命名空间加载当前 checkout 的真实 framework 源码，隔离注册表和入口缓存。
    这一步只避免测试注册污染正常包；不提供无 NPU 运行模式。
 3. 一般注册/分发用例使用实际硬件识别；代际规则用例在导入私有 registry 前替换
