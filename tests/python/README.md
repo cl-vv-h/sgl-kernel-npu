@@ -1,6 +1,7 @@
 # Public-interface tests
 
 ```text
+framework/             # NPU-environment UT for registry, dispatch and generations
 operators/             # Mirror exported operators; test public entry points only
   norm/test_rmsnorm_bias.py
 functional/            # Reserved for functional/modules tests
@@ -13,6 +14,9 @@ utils/
 ```
 
 Legacy tests and their original utils.py remain under sgl_kernel_npu/ unchanged.
+Framework UT runs separately in an NPU environment with a built/installed package:
+`python -m pytest tests/python/framework -v -rs -x --npu-device=0`.
+See [framework/README.md](framework/README.md) for prerequisites, scope and mock boundaries.
 New tests import helpers through tests.python.utils to avoid legacy utils imports.
 The shared conftest.py applies automatic device and reporting setup only to
 operators/ and functional/. New tests must not import implementations directly.

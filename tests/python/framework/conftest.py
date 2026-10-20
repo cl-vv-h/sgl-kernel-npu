@@ -1,0 +1,184 @@
+"""NPU prerequisites and isolated copies of the real framework modules."""
+
+import importlib
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
+from uuid import uuid4
+
+import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def npu_runtime(request):
+    """Require a working NPU installation; never turn a broken setup into skips."""
+    from tests.python.utils.device import validate_npu_options
+
+    config = request.config
+    workers = getattr(config, "workerinput", {}).get(
+        "workercount", config.getoption("numprocesses", default=0)
+    )
+    index = config.getoption("npu_device")
+    validate_npu_options(index, workers)
+
+    import torch
+    import torch_npu  # noqa: F401 -- registers torch.npu
+
+    if not torch.npu.is_available():
+        pytest.fail("Framework UT requires an available Ascend NPU", pytrace=False)
+    if index is not None and index >= torch.npu.device_count():
+        pytest.fail("--npu-device is outside the visible NPU range", pytrace=False)
+
+    previous_device = torch.npu.current_device()
+    try:
+        if index is not None:
+            torch.npu.set_device(index)
+        # Normal import executes the installed package's native-library bootstrap.
+        package = importlib.import_module("sgl_kernel_npu")
+        source = (
+            Path(__file__).resolve().parents[3]
+            / "python"
+            / "sgl_kernel_npu"
+            / "sgl_kernel_npu"
+        )
+        # Prevent a passing run against an older installed Python framework.
+        installed = Path(package.__file__).resolve().parent
+        for file in sorted((source / "operators").rglob("*.py")):
+            relative = file.relative_to(source)
+            installed_file = installed / relative
+            if (
+                not installed_file.is_file()
+                or installed_file.read_bytes() != file.read_bytes()
+            ):
+                pytest.fail(
+                    f"Installed framework differs from this checkout: {relative}. "
+                    "Build/install this branch before running framework UT.",
+                    pytrace=False,
+                )
+        public_api = importlib.import_module("sgl_kernel_npu.operators")
+        generation = importlib.import_module(
+            "sgl_kernel_npu.operators.utils.generation"
+        )
+        hardware = generation.get_hardware()
+        yield SimpleNamespace(
+            torch=torch,
+            package=package,
+            public_api=public_api,
+            generation=generation,
+            hardware=hardware,
+            source=source,
+        )
+    finally:
+        if index is not None:
+            torch.npu.set_device(previous_device)
+
+
+@pytest.fixture
+def package_factory(npu_runtime):
+    """Fresh source modules per case, without altering installed registrations.
+
+    The real package has already loaded above. Private namespaces isolate test
+    registrations and lazy-import caches; they are not a CPU compatibility path.
+    Generation is loaded first so tests can replace hardware detection BEFORE
+    importing registry. The real operators __init__ still runs on load().
+    """
+    namespaces = []
+
+    def create():
+        namespace = f"_sgl_framework_ut_{uuid4().hex}"
+        namespaces.append(namespace)
+        package = ModuleType(namespace)
+        package.__path__ = [str(npu_runtime.source)]
+        package.__package__ = namespace
+        sys.modules[namespace] = package
+
+        name = f"{namespace}.operators.utils.generation"
+        path = npu_runtime.source / "operators" / "utils" / "generation.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        generation = importlib.util.module_from_spec(spec)
+        sys.modules[name] = generation
+        spec.loader.exec_module(generation)
+
+        def import_module(suffix):
+            return importlib.import_module(f"{namespace}.{suffix}")
+
+        def load():
+            api = import_module("operators")
+            registry = import_module("operators.utils.registry")
+            return SimpleNamespace(
+                namespace=namespace,
+                public_api=api,
+                registry=registry,
+                generation=generation,
+                import_module=import_module,
+            )
+
+        return SimpleNamespace(
+            namespace=namespace,
+            generation=generation,
+            import_module=import_module,
+            load=load,
+        )
+
+    try:
+        yield create
+    finally:
+        for name in list(sys.modules):
+            if any(name == ns or name.startswith(f"{ns}.") for ns in namespaces):
+                del sys.modules[name]
+
+
+@pytest.fixture
+def operator_modules(package_factory):
+    return package_factory().load()
+
+
+@pytest.fixture
+def registry(operator_modules):
+    return operator_modules.registry
+
+
+@pytest.fixture
+def generation_module(package_factory):
+    return package_factory().generation
+
+
+@pytest.fixture
+def registry_for_generation(package_factory, monkeypatch):
+    """Simulate registration on another generation, not runtime device switching."""
+
+    def create(name):
+        package = package_factory()
+        generation = package.generation
+        soc = {"A2": "Ascend910B1", "A3": "Ascend910_9391", "A5": "Ascend950"}[name]
+        hardware = generation.Hardware(soc, generation.Generation[name])
+        detector = Mock(return_value=hardware)
+        monkeypatch.setattr(generation, "get_hardware", detector)
+        modules = package.load()
+        modules.hardware = hardware
+        modules.detector = detector
+        return modules
+
+    return create
+
+
+@pytest.fixture
+def rmsnorm_module(operator_modules):
+    return operator_modules.import_module("operators.norm.rmsnorm_bias")
+
+
+@pytest.fixture
+def kernels(operator_modules, monkeypatch):
+    """Replace only kernel leaves; keep actual public adapters and dispatcher."""
+    backends = {}
+    for impl in ("triton", "torch_native"):
+        parent = f"implemention.{impl}.norm"  # codespell:ignore implemention
+        operator_modules.import_module(parent)
+        name = f"{operator_modules.namespace}.{parent}.rmsnorm_bias"
+        module = ModuleType(name)
+        module.rmsnorm_bias = Mock(name=f"{impl}_kernel", return_value=object())
+        monkeypatch.setitem(sys.modules, name, module)
+        backends[impl] = module.rmsnorm_bias
+    return backends
