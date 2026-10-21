@@ -139,22 +139,37 @@ def test_equivalent_support_declarations_allow_aliases(registry_for_generation):
     backend.assert_not_called()
 
 
-# Verify conflicting alias support is rejected without leaving a partial registration.
-def test_conflicting_alias_support_is_rejected_atomically(registry_for_generation):
+# Verify default and exclusion-based aliases reject conflicting support without partial registration.
+@pytest.mark.parametrize(
+    "excluded_names", [None, ("A5",)], ids=["default-all", "exclude-a5"]
+)
+def test_conflicting_alias_support_is_rejected_atomically(
+    registry_for_generation, excluded_names
+):
     modules = registry_for_generation("A2")
     registry, generation = modules.registry, modules.generation
     backend = Mock()
     registry.register_impl(
-        "test.op", "backend", supported_generations={generation.Generation.A3}
+        "test.op", "triton", supported_generations={generation.Generation.A3}
     )(backend)
 
+    alias_options = (
+        {}
+        if excluded_names is None
+        else {
+            "excluded_generations": {
+                generation.Generation[name] for name in excluded_names
+            }
+        }
+    )
     with pytest.raises(ValueError, match="Aliases"):
-        registry.register_impl("test.op", "auto")(backend)
-    assert registry.list_impls_by_name("test.op") == ["backend"]
+        registry.register_impl("test.op", "auto", **alias_options)(backend)
+    assert registry.list_impls_by_name("test.op") == ["triton"]
     with pytest.raises(registry.ImplementationNotFoundError):
         registry.get_impl_by_name("test.op", "auto")
-    with pytest.raises(registry.UnsupportedGenerationError):
-        registry.get_impl_by_name("test.op", "backend")
+    with pytest.raises(registry.UnsupportedGenerationError) as caught:
+        registry.get_impl_by_name("test.op", "triton")
+    assert caught.value.supported_generations == {generation.Generation.A3}
     backend.assert_not_called()
 
 
