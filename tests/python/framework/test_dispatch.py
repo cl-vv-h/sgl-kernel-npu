@@ -1,6 +1,6 @@
 """Public dispatch contracts, with real adapters and inert kernel leaves."""
 
-from unittest.mock import Mock, sentinel
+from unittest.mock import Mock, call, sentinel
 
 import pytest
 
@@ -137,9 +137,31 @@ def test_unsupported_impl_is_rejected_by_public_entry(
         kernel.assert_not_called()
 
 
-# Verify cached backend functions remain correctly routed when impl changes between calls.
-def test_cached_backends_do_not_cross_routes(rmsnorm_module, kernels):
-    for impl in ("triton", "torch_native", "triton"):
-        assert call_rmsnorm(rmsnorm_module, impl=impl) is kernels[impl].return_value
-    assert kernels["triton"].call_count == 2
-    assert kernels["torch_native"].call_count == 1
+# Verify both switching orders preserve per-call routing, fresh arguments, and results.
+@pytest.mark.parametrize(
+    "sequence",
+    [
+        ("triton", "torch_native", "triton", "torch_native"),
+        ("torch_native", "triton", "torch_native", "triton"),
+    ],
+    ids=["triton-first", "torch-native-first"],
+)
+def test_cached_backends_do_not_cross_routes(rmsnorm_module, kernels, sequence):
+    expected_calls = {name: [] for name in kernels}
+    for index, impl in enumerate(sequence):
+        values = (
+            getattr(sentinel, f"input_{index}"),
+            getattr(sentinel, f"weight_{index}"),
+            getattr(sentinel, f"bias_{index}"),
+            1e-6 * (index + 1),
+            getattr(sentinel, f"scale_{index}"),
+            getattr(sentinel, f"offset_{index}"),
+        )
+        expected_result = object()
+        kernels[impl].return_value = expected_result
+
+        assert rmsnorm_module.rmsnorm_bias(*values, impl=impl) is expected_result
+
+        expected_calls[impl].append(call(*values))
+        for name, kernel in kernels.items():
+            assert kernel.call_args_list == expected_calls[name]
