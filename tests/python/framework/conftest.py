@@ -14,14 +14,19 @@ import pytest
 @pytest.fixture(scope="session", autouse=True)
 def npu_runtime(request):
     """Require a working NPU installation; never turn a broken setup into skips."""
-    from tests.python.utils.device import validate_npu_options
-
     config = request.config
     workers = getattr(config, "workerinput", {}).get(
         "workercount", config.getoption("numprocesses", default=0)
     )
     index = config.getoption("npu_device")
-    validate_npu_options(index, workers)
+    if index is not None and index < 0:
+        raise pytest.UsageError(
+            "--npu-device must be a nonnegative visible device index"
+        )
+    if workers not in (None, 0, 1, "0", "1"):
+        raise pytest.UsageError(
+            "Framework UT requires a single worker; remove -n or use -n 1."
+        )
 
     import torch
     import torch_npu  # noqa: F401 -- registers torch.npu
@@ -156,7 +161,7 @@ def kernels(operator_modules, monkeypatch):
     """Replace only kernel leaves; keep actual public adapters and dispatcher."""
     backends = {}
     for impl in ("triton", "torch_native"):
-        parent = f"implemention.{impl}.norm"  # codespell:ignore implemention
+        parent = f"implementation.{impl}.norm"
         operator_modules.import_module(parent)
         name = f"{operator_modules.namespace}.{parent}.rmsnorm_bias"
         module = ModuleType(name)

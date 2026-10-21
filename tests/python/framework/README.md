@@ -1,7 +1,10 @@
 # 公共框架 UT（NPU 环境）
 
 第一批只验证公共算子框架：注册、查询、枚举、公共导出、分发、导入隔离和代际管理。
-基于 `refactor/tests` 的 `409efb4e596b41c3a22befc64ccc2a20dfe2cb65` 编写。
+当前基线：`Todobe:pr/op-refactor`，提交 `5e36a425888b3eee13cb149a3ebe2e22dbedca1e`。
+实现目录使用基线中的 `implementation/backend/module`。
+该基线不包含公共精度/性能测试工具；上层 conftest 仅注册 `--npu-device`，
+框架 fixture 自行校验设备选项，不依赖另一测试重构分支的辅助模块。
 不包含算子数值精度、性能、具体 backend 的 Tensor 转换或真实 AscendC 接入验收。
 
 ## 环境和运行

@@ -1,1 +1,0 @@
-"""Public operator tests."""

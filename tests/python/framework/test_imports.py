@@ -32,9 +32,7 @@ def test_public_import_registers_without_importing_kernel_leaves(operator_module
     assert norm.rmsnorm_bias is module.rmsnorm_bias
     assert registry.list_impls(norm.rmsnorm_bias) == ["auto", "torch_native", "triton"]
     assert not any(
-        name.startswith(
-            f"{operator_modules.namespace}.implemention"
-        )  # codespell:ignore implemention
+        name.startswith(f"{operator_modules.namespace}.implementation")
         for name in sys.modules
     )
     again = operator_modules.import_module("operators.norm.rmsnorm_bias")
@@ -103,7 +101,7 @@ def test_missing_backend_is_isolated_and_failed_import_can_retry(
     operator_modules, rmsnorm_module, kernels, monkeypatch, missing_impl
 ):
     name = (
-        f"{operator_modules.namespace}.implemention.{missing_impl}"  # codespell:ignore implemention
+        f"{operator_modules.namespace}.implementation.{missing_impl}"
         ".norm.rmsnorm_bias"
     )
     leaf = sys.modules[name]
