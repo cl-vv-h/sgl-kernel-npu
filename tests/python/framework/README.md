@@ -40,12 +40,12 @@ python -m pytest tests/python/framework --collect-only -q
 
 | 文件 | 参数化后用例数 | 覆盖内容 |
 | --- | ---: | --- |
-| test_registry.py | 21 | 公共算子/实现注册、重复与冲突、精确查询、别名、枚举及状态保护 |
+| test_registry.py | 20 | 公共算子/实现注册、重复与冲突、精确查询、别名、枚举及状态保护 |
 | test_dispatch.py | 14 | 真实 RMSNorm 公共入口、默认/显式 impl、参数透传、错误不回退、新实现动态接入、缓存路由隔离 |
 | test_generation.py | 10 | 真实硬件识别、A2/A3/A5 型号映射、未知型号、成功缓存和失败重试 |
 | test_generation_registry.py | 17 | 支持/排除集合、空集合、类型校验、当前代际分类、别名范围一致性和注册原子性 |
 | test_imports.py | 7 | checkout 公共导出、模块导入注册、不提前导入 kernel、检测失败、注册隔离、缺依赖与恢复、旧安装包兼容 |
-| 合计 | 69 | 数量来自 pytest collection，不表示已执行通过 |
+| 合计 | 68 | 数量来自 pytest collection，不表示已执行通过 |
 
 不同 backend 的路由、参数方式和异常分别测试，没有把所有维度做笛卡尔乘积。
 `test_backend` 是人为注册的替身，用于验证扩展机制，不是一个真实算子实现。

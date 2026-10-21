@@ -5,22 +5,13 @@ from unittest.mock import Mock
 import pytest
 
 
-# Verify public registration preserves function identity and never executes it.
+# Verify registration preserves the function, uses the explicit name, and never executes it.
 def test_public_registration_preserves_function(registry):
-    operator = Mock()
-
-    assert registry.register_operator("test.op")(operator) is operator
-    assert registry.get_op_name(operator) == "test.op"
-    operator.assert_not_called()
-
-
-# Verify the registered operator name is explicit, not inferred from the function name.
-def test_operator_name_is_explicit_not_inferred(registry):
     def misleading_name():
-        pass
+        raise AssertionError("Registration must not execute the public function")
 
-    registry.register_operator("norm.custom_name")(misleading_name)
-    assert registry.get_op_name(misleading_name) == "norm.custom_name"
+    assert registry.register_operator("test.op")(misleading_name) is misleading_name
+    assert registry.get_op_name(misleading_name) == "test.op"
 
 
 # Verify re-registering a public function fails without changing its original name.
