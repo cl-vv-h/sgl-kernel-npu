@@ -3,28 +3,28 @@
 from ..utils.registry import get_impl_by_name, register_impl, register_operator
 
 
-@register_impl("mem_cache.swiglu_oai_quant", "auto")
-@register_impl("mem_cache.swiglu_oai_quant", "triton")
+@register_impl("activation.swiglu_oai_quant", "auto")
+@register_impl("activation.swiglu_oai_quant", "triton")
 def _triton_impl(
     x, alpha, limit, need_quant=True, group_list=None, group_list_type=None
 ):
-    from ...implementation.triton.mem_cache.swiglu_oai_quant import swiglu_oai_quant
+    from ...implementation.triton.activation.swiglu_oai_quant import swiglu_oai_quant
 
     return swiglu_oai_quant(x, alpha, limit, need_quant, group_list, group_list_type)
 
 
-@register_impl("mem_cache.swiglu_oai_quant", "torch_native")
+@register_impl("activation.swiglu_oai_quant", "torch_native")
 def _torch_native_impl(
     x, alpha, limit, need_quant=True, group_list=None, group_list_type=None
 ):
-    from ...implementation.torch_native.mem_cache.swiglu_oai_quant import (
+    from ...implementation.torch_native.activation.swiglu_oai_quant import (
         swiglu_oai_quant,
     )
 
     return swiglu_oai_quant(x, alpha, limit, need_quant, group_list, group_list_type)
 
 
-@register_operator("mem_cache.swiglu_oai_quant")
+@register_operator("activation.swiglu_oai_quant")
 def swiglu_oai_quant(
     x,
     alpha,
@@ -39,6 +39,6 @@ def swiglu_oai_quant(
 
     Scale is unwritten when need_quant=False; inactive capacity rows are also unspecified, as in the original kernel.
     """
-    return get_impl_by_name("mem_cache.swiglu_oai_quant", impl)(
+    return get_impl_by_name("activation.swiglu_oai_quant", impl)(
         x, alpha, limit, need_quant, group_list, group_list_type
     )

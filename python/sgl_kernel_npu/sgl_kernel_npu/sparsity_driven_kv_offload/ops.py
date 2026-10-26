@@ -4,11 +4,11 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-from ..operators.mem_cache.slot_map_lookup import slot_map_lookup
-from ..operators.mem_cache.unidex_copy import (
+from ..operators.data_move.unidex_copy import (
     _infer_rows_and_block_bytes,
     unidex_copy_inplace,
 )
+from ..operators.mem_cache.slot_map_lookup import slot_map_lookup
 
 
 def _ctype_for_dtype(dtype: torch.dtype):

@@ -24,10 +24,10 @@ def _infer_rows_and_block_bytes(
 
 
 @register_impl(
-    "mem_cache.unidex_copy", "auto", supported_generations=[Generation.ARCH22]
+    "data_move.unidex_copy", "auto", supported_generations=[Generation.ARCH22]
 )
 @register_impl(
-    "mem_cache.unidex_copy", "ascendc", supported_generations=[Generation.ARCH22]
+    "data_move.unidex_copy", "ascendc", supported_generations=[Generation.ARCH22]
 )
 def _ascendc_impl(
     src: torch.Tensor,
@@ -87,7 +87,7 @@ def _ascendc_impl(
     return dst
 
 
-@register_impl("mem_cache.unidex_copy", "torch_native")
+@register_impl("data_move.unidex_copy", "torch_native")
 def _torch_native_impl(
     src,
     dst,
@@ -100,7 +100,7 @@ def _torch_native_impl(
     src_ptr=None,
     dst_ptr=None,
 ):
-    from ...implementation.torch_native.mem_cache.unidex_copy import unidex_copy
+    from ...implementation.torch_native.data_move.unidex_copy import unidex_copy
 
     return unidex_copy(
         src,
@@ -116,7 +116,7 @@ def _torch_native_impl(
     )
 
 
-@register_operator("mem_cache.unidex_copy")
+@register_operator("data_move.unidex_copy")
 def unidex_copy(
     src,
     dst,
@@ -135,7 +135,7 @@ def unidex_copy(
 
     Uses the existing unidex_copy_inplace Python contract and returns dst. The torch_native path requires tensor-backed addresses.
     """
-    return get_impl_by_name("mem_cache.unidex_copy", impl)(
+    return get_impl_by_name("data_move.unidex_copy", impl)(
         src,
         dst,
         src_index,
