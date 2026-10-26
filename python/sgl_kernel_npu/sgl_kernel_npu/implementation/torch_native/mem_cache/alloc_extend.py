@@ -6,15 +6,11 @@ import torch
 def alloc_extend(
     pre_lens, seq_lens, last_loc, free_pages, page_size, out_indices, values
 ):
-    if page_size <= 0:
-        raise ValueError("page_size must be positive")
     output_offset = 0
     page_offset = 0
-    for i in range(pre_lens.numel()):
-        pre, end = int(pre_lens[i].item()), int(seq_lens[i].item())
+    for i in range(len(pre_lens)):
+        pre, end = pre_lens[i], seq_lens[i]
         length = end - pre
-        if length < 0:
-            raise ValueError("seq_lens must be at least pre_lens")
         partial = min(length, (-pre) % page_size)
         out_indices[output_offset : output_offset + partial].copy_(
             last_loc[i] + 1 + torch.arange(partial, device=out_indices.device)

@@ -21,9 +21,13 @@ def _torch_native_impl(
 ):
     from ...implementation.torch_native.mem_cache.alloc_extend import alloc_extend
 
-    return alloc_extend(
-        pre_lens, seq_lens, last_loc, free_pages, page_size, out_indices, values
-    )
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    pre = [int(pre_lens[i].item()) for i in range(pre_lens.numel())]
+    end = [int(seq_lens[i].item()) for i in range(pre_lens.numel())]
+    if any(after < before for before, after in zip(pre, end)):
+        raise ValueError("seq_lens must be at least pre_lens")
+    return alloc_extend(pre, end, last_loc, free_pages, page_size, out_indices, values)
 
 
 @register_operator("mem_cache.alloc_extend")

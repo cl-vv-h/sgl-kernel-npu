@@ -13,8 +13,14 @@ def _torch_npu_impl(input, dtype):
 
 @register_impl("data_move.npu_dtype_cast", "torch_native")
 def _torch_native_impl(input, dtype):
+    import torch
+
     from ...implementation.torch_native.data_move.npu_dtype_cast import npu_dtype_cast
 
+    if not isinstance(dtype, torch.dtype) or "float4" in str(dtype):
+        raise NotImplementedError(
+            "torch_native dtype_cast requires a standard unpacked torch.dtype; use torch_npu for packed FP4"
+        )
     return npu_dtype_cast(input, dtype)
 
 

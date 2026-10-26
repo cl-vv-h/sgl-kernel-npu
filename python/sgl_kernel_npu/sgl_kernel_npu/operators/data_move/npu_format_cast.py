@@ -18,11 +18,23 @@ def _torch_npu_impl(input, acl_format, *, customize_dtype=None, input_dtype=None
 
 @register_impl("data_move.npu_format_cast", "torch_native")
 def _torch_native_impl(input, acl_format, *, customize_dtype=None, input_dtype=None):
+    import torch
+
     from ...implementation.torch_native.data_move.npu_format_cast import npu_format_cast
 
-    return npu_format_cast(
-        input, acl_format, customize_dtype=customize_dtype, input_dtype=input_dtype
-    )
+    if (
+        acl_format not in (0, 2)
+        or customize_dtype is not None
+        or input_dtype is not None
+    ):
+        raise NotImplementedError(
+            "torch_native cannot construct NPU private storage descriptors or custom packed dtypes; use torch_npu"
+        )
+    if acl_format == 0 and input.ndim != 4:
+        raise ValueError("NCHW format requires a rank-4 tensor")
+
+    out = torch.empty(input.shape, dtype=input.dtype, device=input.device)
+    return npu_format_cast(input, out)
 
 
 @register_operator("data_move.npu_format_cast")

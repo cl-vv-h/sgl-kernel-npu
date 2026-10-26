@@ -15,6 +15,8 @@ def _torch_npu_impl(input, dim=-1):
 def _torch_native_impl(input, dim=-1):
     from ...implementation.torch_native.activation.npu_swiglu import npu_swiglu
 
+    if input.shape[dim] % 2:
+        raise ValueError("SwiGLU split dimension must be even")
     return npu_swiglu(input, dim)
 
 

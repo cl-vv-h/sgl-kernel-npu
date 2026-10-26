@@ -17,7 +17,13 @@ def _torch_native_impl(input, indices, updates):
         npu_scatter_nd_update_,
     )
 
-    return npu_scatter_nd_update_(input, indices, updates)
+    depth = indices.shape[-1]
+    if depth == 0 or depth > input.ndim:
+        raise ValueError("indices depth must be in [1, input.ndim]")
+    coordinates = indices.long().reshape(-1, depth)
+    index = tuple(coordinates[:, d] for d in range(depth))
+    values = updates.reshape(coordinates.shape[0], *input.shape[depth:])
+    return npu_scatter_nd_update_(input, index, values)
 
 
 @register_operator("tensor_ops.npu_scatter_nd_update_")

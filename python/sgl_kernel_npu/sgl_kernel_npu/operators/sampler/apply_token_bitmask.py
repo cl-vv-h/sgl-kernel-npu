@@ -13,11 +13,20 @@ def _ascendc_impl(logits, bitmask, indices=None):
 
 @register_impl("sampler.apply_token_bitmask", "torch_native")
 def _torch_native_impl(logits, bitmask, indices=None):
+    import torch
+
     from ...implementation.torch_native.sampler.apply_token_bitmask import (
         apply_token_bitmask,
     )
 
-    return apply_token_bitmask(logits, bitmask, indices)
+    rows = (
+        torch.arange(logits.shape[0], device=logits.device)
+        if indices is None or indices.numel() == 0
+        else indices.long()
+    )
+    cols = torch.arange(logits.shape[1], device=logits.device)
+
+    return apply_token_bitmask(logits, bitmask, rows, cols)
 
 
 @register_operator("sampler.apply_token_bitmask")

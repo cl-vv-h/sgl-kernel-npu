@@ -19,9 +19,28 @@ def _torch_native_impl(
 ):
     from ...implementation.torch_native.mem_cache.assign_cache_op import assign_cache_op
 
-    return assign_cache_op(
-        out, src, dst_start_idx, dst_end_idx, src_start_idx, src_end_idx
-    )
+    inputs = (out, src, dst_start_idx, dst_end_idx, src_start_idx, src_end_idx)
+    if any(t.ndim < 1 for t in inputs):
+        return False
+    # Preserve the existing host-side batch checks, including its src size check.
+    if not (
+        out.shape[0]
+        == src.shape[0]
+        == dst_start_idx.shape[0]
+        == dst_end_idx.shape[0]
+        == src_start_idx.shape[0]
+        == src_end_idx.shape[0]
+    ):
+        return False
+
+    intervals = [
+        (int(dst_start_idx[i].item()), int(dst_end_idx[i].item()))
+        for i in range(out.shape[0])
+    ]
+    starts = [start for start, _ in intervals]
+    src_starts = [int(src_start_idx[i].item()) for i in range(out.shape[0])]
+    src_ends = [int(src_end_idx[i].item()) for i in range(out.shape[0])]
+    return assign_cache_op(out, src.reshape(-1), starts, src_starts, src_ends)
 
 
 @register_operator("mem_cache.assign_cache_op")
