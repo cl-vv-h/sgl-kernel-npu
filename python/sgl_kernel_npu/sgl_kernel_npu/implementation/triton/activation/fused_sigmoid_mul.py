@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import torch
 import triton
 import triton.language as tl
-from sgl_kernel_npu.utils.triton_utils import get_device_properties
 
 _ELEM_BLOCK_SIZE = 2048
 
@@ -27,42 +25,6 @@ def _fused_sigmoid_mul_kernel(
         g = tl.load(gate_ptr + idx, mask=mask).to(tl.float32)
         out = x * tl.sigmoid(g)
         tl.store(out_ptr + idx, out.to(x_ptr.dtype.element_ty), mask=mask)
-
-
-def fused_sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """Compute ``x * sigmoid(gate)`` in one fused AIV kernel (same-shape).
-
-    Args:
-        x: input tensor, any shape.
-        gate: gating tensor, must have the same shape as ``x``.
-
-    Returns:
-        A tensor with the same shape as ``x``.
-    """
-    if x.shape != gate.shape:
-        raise ValueError(
-            f"x and gate must have the same shape, got {x.shape} vs {gate.shape}"
-        )
-
-    x = x.contiguous()
-    gate = gate.contiguous()
-    out = torch.empty_like(x)
-    n = x.numel()
-    if n == 0:
-        return out
-
-    _, num_vectorcore = get_device_properties()
-    num_blocks = min(triton.cdiv(n, _ELEM_BLOCK_SIZE), num_vectorcore)
-    num_blocks = max(num_blocks, 1)
-
-    _fused_sigmoid_mul_kernel[(num_blocks,)](
-        x,
-        gate,
-        out,
-        n,
-        BLOCK_SIZE=_ELEM_BLOCK_SIZE,
-    )
-    return out
 
 
 @triton.jit
