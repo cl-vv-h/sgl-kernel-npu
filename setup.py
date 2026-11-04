@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build sgl-kernel-npu from migrated AscendC operators and Python sources."""
+"""Build sgl-kernel-npu from selected CANN and host C++ operators."""
 import argparse
 import os
 import shutil
@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "python/sgl_kernel_npu"))
 
 from build_tools.cann import PROJECT_ROOT, _remove_tree, build_cann, parse_operators
+from build_tools.selection import resolve_selection
 
 
 def arguments(argv=None):
@@ -25,6 +26,11 @@ def arguments(argv=None):
         "--ops",
         default="all",
         help="all supported migrated native operators, or comma-separated operator IDs",
+    )
+    parser.add_argument(
+        "--build-type",
+        choices=("cann", "cpp"),
+        help="restrict operator selection to this build type; omitted means both",
     )
     parser.add_argument(
         "--artifact",
@@ -61,16 +67,32 @@ def main(argv=None):
             print("sgl-kernel-npu intermediates removed")
             return
 
+    selection = resolve_selection(
+        args.arch_version, args.operators, build_type=args.build_type
+    )
+    if args.artifact == "run" and selection.cpp:
+        raise ValueError(
+            ".run packages support only CANN operators; use --artifact wheel "
+            "or --build-type cann"
+        )
+    print(
+        "BUILD_PLAN: cann={} cpp={}".format(selection.cann, selection.cpp), flush=True
+    )
+    # Validate the full request before replacing any previous output artifacts.
     output = PROJECT_ROOT / "output"
     output.mkdir(exist_ok=True)
     extension = "whl" if args.artifact == "wheel" else "run"
     for path in output.glob(f"sgl_kernel_npu-*.{extension}"):
         path.unlink()
-    result = build_cann(
-        args.arch_version,
-        args.operators,
-        jobs=args.jobs,
-    )
+    result = None
+    if selection.cann:
+        result = build_cann(
+            args.arch_version,
+            # Keep the legacy ALL path and architecture/dependency expansion.
+            ("ALL",) if args.operators == ("ALL",) else selection.cann,
+            jobs=args.jobs,
+        )
+        result.selection_kind = selection.selection_kind
     if args.artifact == "run":
         destination = (
             output / f"sgl_kernel_npu-{args.arch_version}-{result.selection_kind}.run"
@@ -79,7 +101,9 @@ def main(argv=None):
     else:
         from build_tools.torch_wheel import build_torch, build_wheel
 
-        package = build_torch(result, args.arch_version, jobs=args.jobs)
+        package = build_torch(
+            result, args.arch_version, jobs=args.jobs, selection=selection
+        )
         wheel = build_wheel(package)
         destination = output / wheel.name
         shutil.copy2(wheel, destination)

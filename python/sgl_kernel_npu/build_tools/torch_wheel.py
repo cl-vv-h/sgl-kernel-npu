@@ -1,4 +1,4 @@
-"""Continue a selected CANN build through Torch and an optional binary wheel."""
+"""Build selected CANN adapters and host C++ operators into a binary wheel."""
 
 import hashlib
 import importlib.metadata
@@ -33,20 +33,45 @@ def stage_runtime(vendor, package, source_root=PROJECT_ROOT, arch_version="2201"
     )
     shutil.copy2(source_root / "config.ini", package / "config.ini")
     # This is the expanded vendor, not the installer and not SDK libraries.
-    shutil.copytree(vendor, package / "_cann/vendors/sgl_kernel_npu")
+    if vendor is not None:
+        shutil.copytree(vendor, package / "_cann/vendors/sgl_kernel_npu")
 
 
-def build_torch(cann, arch_version, *, jobs=None, source_root=PROJECT_ROOT):
-    if cann.vendor is None:
-        raise RuntimeError("Torch requires a built and installed CANN package")
+def build_torch(
+    cann, arch_version, *, jobs=None, source_root=PROJECT_ROOT, selection=None
+):
     source_root = Path(source_root).resolve()
-    directory = cann.directory.parent / "torch"
+    if cann is not None and cann.vendor is None:
+        raise RuntimeError("Torch requires a built and installed CANN package")
+    if selection is None:
+        # Preserve the internal API for existing CANN-only callers.
+        if cann is None:
+            raise ValueError("A CANN build or native operator selection is required")
+        from build_tools.selection import NativeSelection
+
+        selection = NativeSelection(cann.operators, (), cann.selection_kind)
+    if bool(selection.cann) != (cann is not None):
+        raise ValueError("CANN build does not match the native selection")
+    if jobs is not None and jobs < 1:
+        raise ValueError("--jobs must be positive")
+    cann_ids = cann.operators if cann is not None else ()
+    if not set(selection.cann).issubset(cann_ids):
+        raise ValueError("CANN build is missing requested native operators")
+    if not cann_ids and not selection.cpp:
+        raise ValueError("No native operators selected")
+    vendor = cann.vendor if cann is not None else None
+    build_root = cann.directory.parent if cann is not None else source_root / "build"
+    if build_root.is_symlink():
+        raise RuntimeError("Refusing a symlinked build root")
+    directory = build_root / "torch"
     if directory.is_symlink():
         raise RuntimeError("Refusing a symlinked Torch build directory")
     expected = {
         "CMAKE_HOME_DIRECTORY": str(source_root / "csrc/aclnn_torch_adapter"),
         "SGL_ARCH_VERSION": arch_version,
-        "SGL_CANN_OPERATORS": ";".join(cann.operators),
+        "SGL_CANN_OPERATORS": ";".join(cann_ids),
+        "SGL_CPP_OPERATORS": ";".join(selection.cpp),
+        "SGL_CANN_VENDOR": str(vendor) if vendor is not None else "",
         "Python3_EXECUTABLE": sys.executable,
         "SGL_TORCH_LIBRARY_DIR": str(directory / "lib"),
     }
@@ -57,6 +82,8 @@ def build_torch(cann, arch_version, *, jobs=None, source_root=PROJECT_ROOT):
         "python": sys.executable,
         "python_version": sys.version,
         "sdk": os.environ.get("ASCEND_HOME_PATH", ""),
+        "selection_kind": selection.selection_kind,
+        "build_type": selection.build_type,
     }
     for distribution in ("torch", "torch_npu"):
         try:
@@ -71,18 +98,24 @@ def build_torch(cann, arch_version, *, jobs=None, source_root=PROJECT_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
     signature.write_text(json.dumps(environment, sort_keys=True) + "\n")
     package = directory / "package/sgl_kernel_npu"
-    stage_runtime(cann.vendor, package, source_root, arch_version)
-    (package / "_cann/selected-operators.txt").write_text(
-        "\n".join(cann.operators) + "\n"
-    )
-    (package / "_cann/arch-version.txt").write_text(arch_version + "\n")
+    stage_runtime(vendor, package, source_root, arch_version)
+    if cann_ids:
+        (package / "_cann/selected-operators.txt").write_text(
+            "\n".join(cann_ids) + "\n"
+        )
+        (package / "_cann/arch-version.txt").write_text(arch_version + "\n")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "build_mode": "REFACTOR",
         "arch_version": arch_version,
-        "selection_kind": cann.selection_kind,
-        "operators": sorted(cann.operators),
-        "compute_units": architecture(arch_version, source_root)["compute_units"],
+        "selection_kind": selection.selection_kind,
+        "build_type": selection.build_type,
+        # CANN dependency expansion may add IDs; record what was actually built.
+        "operators": sorted((*cann_ids, *selection.cpp)),
+        "operators_by_type": {"cann": sorted(cann_ids), "cpp": sorted(selection.cpp)},
+        "compute_units": (
+            architecture(arch_version, source_root)["compute_units"] if cann_ids else []
+        ),
     }
     (package / "_build_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     run(
@@ -95,8 +128,9 @@ def build_torch(cann, arch_version, *, jobs=None, source_root=PROJECT_ROOT):
             "-DCMAKE_BUILD_TYPE=Release",
             "-DPython3_EXECUTABLE=" + sys.executable,
             "-DSGL_ARCH_VERSION=" + arch_version,
-            "-DSGL_CANN_OPERATORS=" + ";".join(cann.operators),
-            "-DSGL_CANN_VENDOR=" + str(cann.vendor),
+            "-DSGL_CANN_OPERATORS=" + ";".join(cann_ids),
+            "-DSGL_CPP_OPERATORS=" + ";".join(selection.cpp),
+            "-DSGL_CANN_VENDOR=" + (str(vendor) if vendor is not None else ""),
             "-DSGL_TORCH_LIBRARY_DIR=" + str(directory / "lib"),
         ],
         directory / "configure.log",
@@ -120,7 +154,8 @@ def wheel_build_tag(manifest):
     if kind not in ("all", "custom"):
         raise ValueError("Invalid wheel selection kind")
     suffix = ""
-    if kind == "custom":
+    # Type-scoped ALL wheels have different contents, so hash their IDs too.
+    if kind == "custom" or manifest.get("schema_version", 1) >= 2:
         suffix = hashlib.sha256(
             ",".join(sorted(manifest["operators"])).encode()
         ).hexdigest()[:10]
@@ -200,7 +235,7 @@ def build_wheel(package, *, source_root=PROJECT_ROOT):
     verify_wheel(wheels[0], staged)
     print("WHEEL: " + str(wheels[0]), flush=True)
     print(
-        "PASS: wheel contains this build's selected CANN vendor and Torch library; NPU tests still required"
+        "PASS: wheel matches this build's native operator manifest and Torch library; NPU tests still required"
     )
     return wheels[0]
 
@@ -236,7 +271,7 @@ def setup_refactor():
     setup(
         name="sgl_kernel_npu",
         version=config.get("global", "version"),
-        description="Selected CANN operators and Torch adapters for Ascend NPU",
+        description="Selected CANN and C++ operators for Ascend NPU",
         packages=find_namespace_packages(
             where=str(package.parent),
             include=["sgl_kernel_npu", "sgl_kernel_npu.*"],

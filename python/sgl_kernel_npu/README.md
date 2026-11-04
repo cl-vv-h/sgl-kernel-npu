@@ -4,7 +4,7 @@
 
 The repository-root `setup.py` builds the new `sgl-kernel-npu` package. It includes
 all Python interfaces and implementation sources, including Triton and Torch
-native, plus the migrated AscendC operators selected for this build.
+native, plus the CANN and host C++ operators selected for this build.
 
 The existing `build.sh` and nested Python `setup.py` keep their original build
 behavior. DeepEP, memory saver and attentions remain independent packages built
@@ -29,6 +29,18 @@ python3 /workspace/sgl-kernel-npu/setup.py --arch-version 2201
 python3 /workspace/sgl-kernel-npu/setup.py \
   --arch-version 2201 --ops apply_token_bitmask
 
+# Mix an existing CANN operator with a host C++ operator.
+python3 /workspace/sgl-kernel-npu/setup.py \
+  --arch-version 2201 --ops apply_token_bitmask,transfer_mamba_state
+
+# All host C++ operators; no custom CANN package is generated.
+python3 /workspace/sgl-kernel-npu/setup.py \
+  --arch-version 2201 --build-type cpp --ops all
+
+# All supported CANN operators, excluding host C++ operators.
+python3 /workspace/sgl-kernel-npu/setup.py \
+  --arch-version 2201 --build-type cann --ops all
+
 # CANN installer only, for direct ACLNN use; no Torch adapter or wheel.
 python3 /workspace/sgl-kernel-npu/setup.py \
   --arch-version 2201 --ops apply_token_bitmask --artifact run
@@ -37,13 +49,14 @@ python3 /workspace/sgl-kernel-npu/setup.py \
 ### Command-line options
 
 These options belong to the repository-root `setup.py`. The existing `build.sh`
-keeps its own options; it does not accept `--arch-version`, `--ops` or `--artifact`.
+keeps its own options; it does not accept the new entry's selection options.
 No `SGL_BUILD_MODE` setting or `-a kernels` is needed for the new entry.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--arch-version 2201/3510` | Required | Architecture coverage, independent of the current device. May be omitted only for help or standalone `--make_clean`. |
 | `--ops all` or `--ops ID[,ID...]` | `all` | All supported migrated native operators, or an explicit list. Unknown, repeated or unsupported IDs fail. |
+| `--build-type cann/cpp` | Unrestricted | Restrict selection to one type. Without it, explicit IDs may mix types and `all` selects both. |
 | `--artifact run/wheel` | `wheel` | CANN installer or installable Python wheel. |
 | `-j N` / `--jobs N` | Build tool default | Limit the number of simultaneous build jobs; must be a positive integer. |
 | `--make_clean` | Off | Clear new-build intermediates; alone, clean and exit. With build options, clean then rebuild. |
@@ -51,6 +64,15 @@ No `SGL_BUILD_MODE` setting or `-a kernels` is needed for the new entry.
 
 `--ops` accepts comma-separated IDs; do not mix `all` with IDs or repeat an ID.
 It selects native operators only, not which Python modules enter the wheel.
+`--build-type` restricts both explicit IDs and `all`: an explicit ID of the wrong
+type fails instead of being silently omitted. `all` filters by type and declared
+architecture support. Omit the build type to allow mixed CANN and C++ IDs.
+
+CPP-only builds still require Linux, CANN's ACL headers/runtime and Torch/torch_npu.
+They skip custom OpDef generation, Tiling, device Kernel compilation and the vendor
+installer. They do not bundle a `_cann` vendor directory. A `.run` artifact can
+contain only CANN operators; requests containing C++ IDs fail before compilation.
+Use `--build-type cann --ops all --artifact run` for a complete CANN installer.
 `-j N` and `--jobs N` are equivalent. They pass `--parallel N` to the CANN and
 Torch CMake builds. More simultaneous jobs can reduce build time but consume
 more CPU and memory. This setting does not change the operator's runtime
@@ -77,6 +99,49 @@ API documentation follows the shared framework's `arch22` and `arch35` names.
 Final artifacts go to `/workspace/sgl-kernel-npu/output/`. A wheel build removes
 previous `sgl_kernel_npu-*.whl` files there before building; a run build removes
 previous `sgl_kernel_npu-*.run` files. Other packages' outputs are left in place.
+
+### Host C++ declarations and selection
+
+Existing CANN declarations and architecture variants require no changes. Host C++
+operators use a separate registry, for example in `csrc/data_move/CMakeLists.txt`:
+
+```cmake
+sgl_register_cpp_operator(
+    ID transfer_mamba_state
+    SUPPORTED_ARCHS 2201 3510
+    SOURCES transfer_mamba_state.cpp
+    TORCH_ADAPTER torch_adapter.cpp
+)
+```
+
+`ID`, `SUPPORTED_ARCHS`, `SOURCES` and `TORCH_ADAPTER` are required. Source paths
+are relative to the declaring file. IDs must be unique across both registries.
+New C++ domains must be added to `sgl_add_cpp_operator_domains()` in
+`csrc/cmake/cpp_operators.cmake`; existing CANN discovery remains unchanged.
+
+`csrc/native_selection` resolves the declarations with a language-free CMake
+configure, before SDK or Torch discovery. The Python coordinator sends only the
+CANN subset to the existing CANN builder and only selected adapter/C++ sources
+to the Torch library. Existing CANN dependency expansion, such as the paired
+cache-location operators, remains in that builder; its actual expanded IDs enter
+the wheel manifest. Selection, exclusions and the final build plan appear in logs.
+
+For each selected C++ ID, the Torch target defines `SGL_CPP_<UPPERCASE_ID>=1`.
+When registration or implementation files are shared, guard each schema, binding
+and public entrypoint with its corresponding macro. Shared translation units are
+compiled once. The two direct-state transfers share their helper implementation
+but expose only selected entrypoints. Unselected operators must not leave bindings
+to omitted functions.
+
+Run the CPU-only build-selection regression tests with CMake and a C++ compiler:
+
+```bash
+python3 -m pytest tests/build_tools -q
+```
+
+The suite checks selection, the actual Torch CMake target using dependency stubs,
+preprocessed registrations, coordinator dispatch, cache invalidation and packaging.
+These checks do not replace compilation and execution with real CANN/Torch on NPU.
 
 ### CANN operator declarations
 
@@ -248,12 +313,17 @@ The distribution name remains `sgl-kernel-npu`, imported as `sgl_kernel_npu`.
 Wheel build tags distinguish architecture and native operator selection:
 
 ```text
-sgl_kernel_npu-<version>-1refactor2201all-<python>-<abi>-<platform>.whl
+sgl_kernel_npu-<version>-1refactor2201all<set-id>-<python>-<abi>-<platform>.whl
 sgl_kernel_npu-<version>-1refactor2201custom<set-id>-<python>-<abi>-<platform>.whl
 ```
 
 Omitted `--ops` or `--ops all` produces `all`; explicit IDs produce `custom`.
-The package's `_build_manifest.json` records the full selection and SDK targets.
+Both kinds include a hash of the actual operator IDs, so `--build-type cann`,
+`--build-type cpp` and unrestricted `all` wheels have distinct build tags.
+The package's schema-2 `_build_manifest.json` records the full actual selection,
+`operators_by_type`, requested build type and SDK targets. CPP-only builds have
+no device compute units. Cache checks cover both subsets and the vendor path;
+changing the build type or either subset requires `--make_clean`.
 Subset wheels replace one another; they do not add operators to an existing
 installation. Reinstall explicitly and start a new Python process when switching:
 
