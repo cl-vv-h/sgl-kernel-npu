@@ -5,20 +5,6 @@ import triton
 import triton.language as tl
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": bv, "multibuffer": multibuffer})
-        for bv in (64, 128)
-        for multibuffer in (False, True)
-    ],
-    key=[
-        "H_Q",
-        "H_K",
-        "H_V",
-        "K",
-        "V",
-    ],
-)
 @triton.jit
 def _kda_target_verify_kernel(
     A_log_ptr,
@@ -424,9 +410,10 @@ def kda_target_verify(
     ``x * rsqrt(sum(x*x) + 1e-12)``. Other dimensions retain the original
     ``x / (sqrt(sum(x*x)) + 1e-6)`` normalization and computation.
 
-    K=V=128 autotunes BV=64/128 and multibuffer off/on. Warm up each input
-    configuration before graph capture. Autotune repeats the invocation, so
-    the intermediate state buffer must not alias the persistent state source.
+    K=V=128 uses BV=64 with multibuffer enabled. Other dimensions use
+    BV=min(64, next_power_of_2(V)) with multibuffer disabled. Warm up the
+    kernel before graph capture. The intermediate state buffer must not
+    alias the persistent state source.
     """
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, and v must have shape [1, tokens, heads, dim]")
@@ -523,17 +510,14 @@ def kda_target_verify(
     if bk > 256:
         raise ValueError("key dimensions greater than 256 are unsupported")
     if key_dim == 128 and value_dim == 128:
-        kernel = _kda_target_verify_kernel
-        launch_options = {}
+        launch_options = triton.Config({"BV": 64, "multibuffer": True}).all_kwargs()
     else:
-        # Bypass autotune for other dimensions.
-        kernel = _kda_target_verify_kernel.fn
         launch_options = {
             "BV": min(64, triton.next_power_of_2(value_dim)),
             "multibuffer": False,
         }
-    grid = lambda meta: (batch, h_v, triton.cdiv(value_dim, meta["BV"]))
-    kernel[grid](
+    grid = (batch, h_v, triton.cdiv(value_dim, launch_options["BV"]))
+    _kda_target_verify_kernel[grid](
         A_log,
         dt_bias,
         q,
